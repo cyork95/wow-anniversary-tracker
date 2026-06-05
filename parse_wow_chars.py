@@ -286,28 +286,30 @@ def gather() -> list[dict]:
                 active.append(str(title))
         chars[ck]["active_quests"] = active
 
-    # ── Defias Pillager – Skillet identity data ───────────────────────────────
-    print("  Defias Pillager (Skillet)…")
+    # ── Defias Pillager – all character folders ───────────────────────────────
+    # Some characters only have AddOns.txt (no SavedVariables); the folder name IS the character name.
+    # For those that do have Skillet, we get class/race/faction too.
+    print("  Defias Pillager (all folders)…")
     dp_root = WOW_ACCOUNT_DIR / "Defias Pillager"
     if dp_root.exists():
         for cdir in sorted(dp_root.iterdir()):
             if not cdir.is_dir():
                 continue
+            realm = "Defias Pillager"
+            # Try Skillet first for class/race detail
             who = _skillet_who(cdir / "SavedVariables" / "Skillet-Classic.lua")
-            name = who.get("player", "")
-            if not name:
-                continue
-            realm = who.get("realm", "Defias Pillager")
+            name = who.get("player", "") or cdir.name  # fall back to folder name
             ck = f"{realm}|{name}"
             if ck in chars:
-                continue  # already have richer DataStore data
+                continue
             cls = who.get("classFile", "").upper()
+            source = "Skillet" if who.get("player") else "FolderName"
             chars[ck] = {
                 "name": name,
                 "realm": realm,
                 "level": 1,
                 "class": cls,
-                "class_display": CLASS_NAMES.get(cls, cls.capitalize()),
+                "class_display": CLASS_NAMES.get(cls, ""),
                 "race": RACE_NAMES.get(who.get("raceFile", ""), who.get("raceFile", "")),
                 "faction": who.get("faction", "Alliance"),
                 "money": 0,
@@ -324,8 +326,46 @@ def gather() -> list[dict]:
                 "professions": {},
                 "avg_ilvl": 0.0,
                 "active_quests": [],
-                "source": "Skillet",
+                "source": source,
             }
+
+    # ── DataStore profileKeys fallback (catches chars with no Characters data) ─
+    # A character can appear in profileKeys but have no entry in global.Characters
+    # if DataStore registered them but never completed a sync (e.g. Zephyraan).
+    print("  Checking for profileKeys-only characters…")
+    keys_db = _load(WOW_SAVED_VARS / "DataStore_Characters.lua")
+    for pk in (keys_db.get("profileKeys") or {}).keys():
+        # profileKey format: "CharName - Realm"
+        if " - " not in pk:
+            continue
+        name, realm = pk.rsplit(" - ", 1)
+        ck = f"{realm}|{name}"
+        if ck not in chars:
+            chars[ck] = {
+                "name": name,
+                "realm": realm,
+                "level": 1,
+                "class": "",
+                "class_display": "",
+                "race": "",
+                "faction": "Alliance",
+                "money": 0,
+                "played": 0,
+                "zone": "",
+                "sub_zone": "",
+                "guild": "",
+                "guild_rank": "",
+                "xp": 0,
+                "xp_max": 1,
+                "rest_xp": 0,
+                "last_login": 0,
+                "bind": "",
+                "professions": {},
+                "avg_ilvl": 0.0,
+                "active_quests": [],
+                "source": "ProfileKey",
+            }
+            print(f"    Found orphaned profileKey: {name} ({realm})")
 
     return sorted(chars.values(), key=lambda c: (-c["level"], c["realm"], c["name"]))
 
@@ -662,7 +702,12 @@ function buildCard(c){
       ${questHtml}
       <div class="ir">
         <span class="ico"></span>
-        <span class="badge ${c.source==='DataStore'?'badge-ds':'badge-limited'}">${c.source==='DataStore'?'Full data':'Limited data'}</span>
+        <span class="badge ${c.source==='DataStore'?'badge-ds':'badge-limited'}">${
+          c.source==='DataStore'?'Full data':
+          c.source==='Skillet'?'Class known':
+          c.source==='FolderName'?'Name only':
+          'No addon data'
+        }</span>
       </div>
     </div>
   `;

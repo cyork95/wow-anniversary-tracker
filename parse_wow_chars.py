@@ -954,10 +954,14 @@ def _parse_mails(path: Path) -> dict | None:
         if not isinstance(info, dict):
             continue
         mails = info.get("Mails")
-        if not isinstance(mails, dict):
+        if isinstance(mails, list):
+            mails_iter = enumerate(mails)
+        elif isinstance(mails, dict):
+            mails_iter = mails.items()
+        else:
             continue
         items = []
-        for _, mail in mails.items():
+        for _, mail in mails_iter:
             if not isinstance(mail, dict):
                 continue
             link  = mail.get("link", "")

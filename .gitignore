@@ -1,0 +1,5 @@
+wow_tracker.html
+*.bak
+__pycache__/
+*.pyc
+.claude/

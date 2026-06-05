@@ -9,9 +9,10 @@ import re, json
 from pathlib import Path
 from datetime import datetime
 
-# ─── Config ────────────────────────────────────────────────────────────────────
+# --- Config -------------------------------------------------------------------
 WOW_SAVED_VARS  = Path(r"C:\Program Files (x86)\World of Warcraft\_anniversary_\WTF\Account\383258958#1\SavedVariables")
 WOW_ACCOUNT_DIR = WOW_SAVED_VARS.parent
+WOW_ADDONS_DIR  = Path(r"C:\Program Files (x86)\World of Warcraft\_anniversary_\Interface\AddOns")
 OUTPUT_HTML     = Path(__file__).parent / "index.html"
 
 CLASS_COLORS = {
@@ -53,8 +54,17 @@ RACE_NAMES = {
 
 MAX_LEVEL = 60  # Classic Anniversary
 
+QUALITY_COLORS = {
+    "9d9d9d": "poor",
+    "ffffff": "common",
+    "1eff00": "uncommon",
+    "0070dd": "rare",
+    "a335ee": "epic",
+    "ff8000": "legendary",
+}
 
-# ─── Lua parser ────────────────────────────────────────────────────────────────
+
+# --- Lua parser ---------------------------------------------------------------
 class LuaParser:
     """Minimal recursive descent parser for WoW SavedVariable Lua table files."""
 
@@ -119,7 +129,7 @@ class LuaParser:
             if self.s[self.p:self.p + len(kw)] == kw:
                 self.p += len(kw)
                 return v
-        # unknown token — skip to next delimiter
+        # unknown token -- skip to next delimiter
         i = self.p
         while self.p < self.n and self.s[self.p] not in ",}\n":
             self.p += 1
@@ -180,7 +190,7 @@ def _load(path: Path) -> dict:
 
 
 def _skillet_who(path: Path) -> dict:
-    """Extract SkilletWho via regex — faster than full parse for this small block."""
+    """Extract SkilletWho via regex -- faster than full parse for this small block."""
     if not path.exists():
         return {}
     txt = path.read_text(encoding="utf-8", errors="replace")
@@ -193,7 +203,7 @@ def _skillet_who(path: Path) -> dict:
 def _parse_all_vars(text: str) -> dict:
     """Parse every top-level  VARNAME = { ... }  assignment in a Lua file."""
     result = {}
-    for m in re.finditer(r'^([A-Z][A-Z0-9_]*)\s*=\s*(\{)', text, re.MULTILINE):
+    for m in re.finditer(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\{)', text, re.MULTILINE):
         varname = m.group(1)
         try:
             result[varname] = LuaParser.parse_table_at(text, m.start(2))
@@ -202,7 +212,7 @@ def _parse_all_vars(text: str) -> dict:
     return result
 
 
-# AutoBiographer event type/subtype → human label --------------------------------
+# AutoBiographer event type/subtype -> human label ----------------------------
 _AB_TYPES = {
     (2,  6):  "levelup",
     (12, 8):  "quest",
@@ -231,7 +241,7 @@ def _parse_autobiographer(path: Path) -> dict | None:
     vars_ = _parse_all_vars(text)
     result: dict = {}
 
-    # ── INFO_CHAR ─────────────────────────────────────────────────────────────
+    # -- INFO_CHAR -------------------------------------------------------------
     info = vars_.get("AUTOBIOGRAPHER_INFO_CHAR") or {}
     if isinstance(info, dict):
         result["zone"]       = info.get("CurrentZone", "")
@@ -240,7 +250,7 @@ def _parse_autobiographer(path: Path) -> dict | None:
         result["guild_rank"] = info.get("GuildRankName", "")
         result["played"]     = int(info.get("LastTotalTimePlayed", 0) or 0)
 
-    # ── CATALOGS_CHAR — zones explored ────────────────────────────────────────
+    # -- CATALOGS_CHAR -- zones explored ---------------------------------------
     catalogs = vars_.get("AUTOBIOGRAPHER_CATALOGS_CHAR") or {}
     sz_cat = catalogs.get("SubZoneCatalog") if isinstance(catalogs, dict) else {}
     if isinstance(sz_cat, dict):
@@ -251,7 +261,7 @@ def _parse_autobiographer(path: Path) -> dict | None:
                 zones_map.setdefault(zone, []).append(sz_name)
         result["zones_visited"] = {z: sorted(subzones) for z, subzones in sorted(zones_map.items())}
 
-    # ── EVENTS_CHAR — timeline ────────────────────────────────────────────────
+    # -- EVENTS_CHAR -- timeline -----------------------------------------------
     events_tbl = vars_.get("AUTOBIOGRAPHER_EVENTS_CHAR") or {}
     if isinstance(events_tbl, dict):
         timeline = []
@@ -307,12 +317,216 @@ def _parse_autobiographer(path: Path) -> dict | None:
     return result or None
 
 
-# ─── Data aggregation ──────────────────────────────────────────────────────────
+# --- Achievement parsing ------------------------------------------------------
+def _load_achievement_names() -> dict:
+    """
+    Read AnniversaryAchievements addon files and build a dict of
+    {int_index: "Display Name"} by counting CreateAchievement('AN_XXX') calls
+    in order and mapping each key to its English string from en.lua.
+    """
+    addon_dir = WOW_ADDONS_DIR / "AnniversaryAchievements"
+    ach_lua   = addon_dir / "achievements" / "achievements.lua"
+    en_lua    = addon_dir / "localization" / "en.lua"
+
+    if not ach_lua.exists():
+        print(f"  WARN: achievements.lua not found at {ach_lua}")
+        return {}
+
+    # Read english strings: AN_XXX = "Display Name"
+    en_strings: dict[str, str] = {}
+    if en_lua.exists():
+        try:
+            en_text = en_lua.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r"(AN_[A-Z0-9_]+)\s*=\s*'([^']*)'", en_text):
+                en_strings[m.group(1)] = m.group(2)
+        except Exception as e:
+            print(f"  WARN en.lua: {e}")
+
+    # Read achievements.lua: count CreateAchievement('AN_XXX') calls in order
+    ach_names: dict[int, str] = {}
+    try:
+        ach_text = ach_lua.read_text(encoding="utf-8", errors="replace")
+        idx = 1
+        for m in re.finditer(r"CreateAchievement\s*\(\s*['\"]([^'\"]+)['\"]", ach_text):
+            key = m.group(1)
+            display = en_strings.get(key, key)
+            ach_names[idx] = display
+            idx += 1
+    except Exception as e:
+        print(f"  WARN achievements.lua: {e}")
+
+    return ach_names
+
+
+def _parse_achievements(path: Path, ach_names: dict) -> dict | None:
+    """
+    Parse AnniversaryAchievements.lua per-character saved vars.
+    CA_LocalData structure: {int_index: {1: bool_completed, 2: timestamp, 3: criteria_dict}}
+    Returns {"completed": [{"name": str, "ts": int}, ...], "total": int}
+    """
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    vars_ = _parse_all_vars(text)
+    local_data = vars_.get("CA_LocalData")
+    if not isinstance(local_data, dict):
+        return None
+
+    completed = []
+    total = len(ach_names) if ach_names else len(local_data)
+
+    for idx, entry in local_data.items():
+        if not isinstance(entry, dict):
+            continue
+        is_completed = entry.get(1)
+        ts = int(entry.get(2, 0) or 0)
+        if is_completed:
+            name = ach_names.get(idx, f"Achievement #{idx}") if ach_names else f"Achievement #{idx}"
+            completed.append({"name": name, "ts": ts})
+
+    # Sort newest-first
+    completed.sort(key=lambda x: x["ts"], reverse=True)
+
+    return {"completed": completed, "total": total}
+
+
+# --- Container/inventory parsing ----------------------------------------------
+def _parse_containers(path: Path) -> dict | None:
+    """
+    Parse DataStore_Containers.lua and extract bag + bank contents.
+    Returns {
+      "bags": [{"name": "Bag N", "items": [{"name": str, "count": int, "quality": str}], "size": int, "free": int}],
+      "bank": {"items": [...], "size": int, "free": int}
+    }
+    """
+    if not path.exists():
+        return None
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    vars_ = _parse_all_vars(text)
+    db = vars_.get("DataStore_ContainersDB")
+    if not isinstance(db, dict):
+        return None
+
+    global_data = db.get("global") or {}
+    if not isinstance(global_data, dict):
+        return None
+
+    # We return the raw per-character containers map; caller matches to chars
+    return global_data.get("Characters") or {}
+
+
+def _extract_bag_contents(bag_data: dict) -> dict:
+    """
+    Extract items from a single bag entry.
+    bag_data has: links (dict), counts (dict), size (int), freeslots (int)
+    Returns {"items": [...], "size": int, "free": int}
+    """
+    if not isinstance(bag_data, dict):
+        return {"items": [], "size": 0, "free": 0}
+
+    links  = bag_data.get("links")  or {}
+    counts = bag_data.get("counts") or {}
+    size   = int(bag_data.get("size", 0) or 0)
+    free   = int(bag_data.get("freeslots", 0) or 0)
+
+    items = []
+    if isinstance(links, dict):
+        for slot_key, link in links.items():
+            if not link or not isinstance(link, str):
+                continue
+            # Extract item name from link: |cffXXXXXX|Hitem:...|h[Item Name]|h|r
+            name_m = re.search(r'\[([^\]]+)\]', link)
+            if not name_m:
+                continue
+            item_name = name_m.group(1)
+
+            # Extract quality color
+            quality = "common"
+            color_m = re.search(r'\|cff([0-9a-fA-F]{6})', link)
+            if color_m:
+                color_hex = color_m.group(1).lower()
+                quality = QUALITY_COLORS.get(color_hex, "common")
+
+            count = 1
+            if isinstance(counts, dict):
+                cnt = counts.get(slot_key)
+                if cnt is not None:
+                    count = int(cnt or 1)
+
+            items.append({"name": item_name, "count": count, "quality": quality})
+
+    return {"items": items, "size": size, "free": free}
+
+
+def _build_char_containers(containers_entry: dict) -> dict:
+    """
+    Given a single character's Containers dict from DataStore_Containers,
+    build the structured bags + bank result.
+    """
+    if not isinstance(containers_entry, dict):
+        return {}
+
+    raw_containers = containers_entry.get("Containers") or {}
+    if not isinstance(raw_containers, dict):
+        return {}
+
+    bags = []
+    # Bags 0-4: character bags (0=backpack, 1-4=bag slots)
+    for bag_num in range(5):
+        bag_key = f"Bag{bag_num}"
+        bag_data = raw_containers.get(bag_key)
+        if bag_data is None:
+            continue
+        contents = _extract_bag_contents(bag_data)
+        bag_label = "Backpack" if bag_num == 0 else f"Bag {bag_num}"
+        bags.append({
+            "name": bag_label,
+            "items": contents["items"],
+            "size": contents["size"],
+            "free": contents["free"],
+        })
+
+    # Bag100: bank
+    bank_data = raw_containers.get("Bag100")
+    bank = None
+    if bank_data is not None:
+        contents = _extract_bag_contents(bank_data)
+        bank = {
+            "items": contents["items"],
+            "size": contents["size"],
+            "free": contents["free"],
+        }
+
+    result: dict = {}
+    if bags:
+        result["bags"] = bags
+    if bank:
+        result["bank"] = bank
+
+    return result if result else {}
+
+
+# --- Data aggregation ---------------------------------------------------------
 def gather() -> list[dict]:
     chars: dict[str, dict] = {}
 
-    # ── DataStore_Characters (core stats) ─────────────────────────────────────
-    print("  DataStore_Characters…")
+    # Load achievement names once at the start
+    print("  Loading achievement names...")
+    ach_names = _load_achievement_names()
+    if ach_names:
+        print(f"    Found {len(ach_names)} achievement definitions")
+
+    # -- DataStore_Characters (core stats) ------------------------------------
+    print("  DataStore_Characters...")
     db = _load(WOW_SAVED_VARS / "DataStore_Characters.lua")
     for key, info in ((db.get("global") or {}).get("Characters") or {}).items():
         if not isinstance(info, dict):
@@ -347,8 +561,8 @@ def gather() -> list[dict]:
             "source": "DataStore",
         }
 
-    # ── DataStore_Crafts (professions) ────────────────────────────────────────
-    print("  DataStore_Crafts…")
+    # -- DataStore_Crafts (professions) ----------------------------------------
+    print("  DataStore_Crafts...")
     db = _load(WOW_SAVED_VARS / "DataStore_Crafts.lua")
     for key, info in ((db.get("global") or {}).get("Characters") or {}).items():
         if not isinstance(info, dict):
@@ -362,7 +576,7 @@ def gather() -> list[dict]:
         for pname, pdata in (info.get("Professions") or {}).items():
             if not isinstance(pdata, dict):
                 continue
-            # Skip riding skills — stored as professions in Classic but not real crafting profs
+            # Skip riding skills -- stored as professions in Classic but not real crafting profs
             if "Riding" in pname:
                 continue
             chars[ck]["professions"][pname] = {
@@ -372,8 +586,8 @@ def gather() -> list[dict]:
                 "secondary": bool(pdata.get("isSecondary")),
             }
 
-    # ── DataStore_Inventory (average item level) ──────────────────────────────
-    print("  DataStore_Inventory…")
+    # -- DataStore_Inventory (average item level) ------------------------------
+    print("  DataStore_Inventory...")
     db = _load(WOW_SAVED_VARS / "DataStore_Inventory.lua")
     for key, info in ((db.get("global") or {}).get("Characters") or {}).items():
         if not isinstance(info, dict):
@@ -386,8 +600,8 @@ def gather() -> list[dict]:
             ilvl = info.get("overallAIL") or info.get("averageItemLvl") or 0
             chars[ck]["avg_ilvl"] = round(float(ilvl), 1)
 
-    # ── DataStore_Quests (active quests) ──────────────────────────────────────
-    print("  DataStore_Quests…")
+    # -- DataStore_Quests (active quests) --------------------------------------
+    print("  DataStore_Quests...")
     db = _load(WOW_SAVED_VARS / "DataStore_Quests.lua")
     for key, info in ((db.get("global") or {}).get("Characters") or {}).items():
         if not isinstance(info, dict):
@@ -410,12 +624,29 @@ def gather() -> list[dict]:
                 active.append(str(title))
         chars[ck]["active_quests"] = active
 
-    # ── Per-realm character folders (Dreamscythe\, Defias Pillager\, Doomhowl\, …) ─
+    # -- DataStore_Containers (bags + bank) ------------------------------------
+    print("  DataStore_Containers...")
+    containers_path = WOW_SAVED_VARS / "DataStore_Containers.lua"
+    raw_containers_map = _parse_containers(containers_path)
+    # raw_containers_map is {key: char_entry} where key = "Default.Realm.Name"
+    if raw_containers_map:
+        for key, char_entry in raw_containers_map.items():
+            p = key.split(".", 2)
+            if len(p) < 3:
+                continue
+            ck = f"{p[1]}|{p[2]}"
+            if ck not in chars:
+                continue
+            built = _build_char_containers(char_entry)
+            if built:
+                chars[ck]["containers"] = built
+
+    # -- Per-realm character folders -------------------------------------------
     # The WTF structure has a subfolder per realm under the account directory.
     # Each realm folder contains per-character subfolders with their own SavedVariables.
     # We scan every realm subfolder dynamically so new realms are picked up automatically.
     # Even for DataStore characters we still enrich with AutoBiographer event data.
-    print("  Scanning per-realm character folders…")
+    print("  Scanning per-realm character folders...")
     for realm_dir in sorted(WOW_ACCOUNT_DIR.iterdir()):
         if not realm_dir.is_dir() or realm_dir.name == "SavedVariables":
             continue
@@ -471,10 +702,23 @@ def gather() -> list[dict]:
                 if not chars[ck].get("played") and ab.get("played"):
                     chars[ck]["played"] = ab["played"]
 
-    # ── DataStore profileKeys fallback (catches chars with no Characters data) ─
+                # Fix level for non-DataStore characters at level 1 using levelup events
+                if chars[ck].get("source") != "DataStore" and chars[ck].get("level", 1) == 1:
+                    levelup_events = [e for e in (ab.get("events") or []) if e.get("k") == "levelup"]
+                    if levelup_events:
+                        max_lvl = max(e.get("lvl", 1) for e in levelup_events)
+                        if max_lvl > 1:
+                            chars[ck]["level"] = max_lvl
+
+            # Parse achievements
+            ach = _parse_achievements(sv_dir / "AnniversaryAchievements.lua", ach_names)
+            if ach:
+                chars[ck]["achievements"] = ach
+
+    # -- DataStore profileKeys fallback (catches chars with no Characters data) -
     # A character can appear in profileKeys but have no entry in global.Characters
     # if DataStore registered them but never completed a sync (e.g. Zephyraan).
-    print("  Checking for profileKeys-only characters…")
+    print("  Checking for profileKeys-only characters...")
     keys_db = _load(WOW_SAVED_VARS / "DataStore_Characters.lua")
     for pk in (keys_db.get("profileKeys") or {}).keys():
         # profileKey format: "CharName - Realm"
@@ -512,7 +756,7 @@ def gather() -> list[dict]:
     return sorted(chars.values(), key=lambda c: (-c["level"], c["realm"], c["name"]))
 
 
-# ─── Formatting helpers ────────────────────────────────────────────────────────
+# --- Formatting helpers -------------------------------------------------------
 def fmt_money(copper: int) -> dict:
     return {"g": copper // 10000, "s": (copper % 10000) // 100, "c": copper % 100}
 
@@ -537,14 +781,14 @@ def fmt_date(ts: int) -> str:
         return "?"
 
 
-# ─── HTML template ─────────────────────────────────────────────────────────────
+# --- HTML template ------------------------------------------------------------
 HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WoW Classic — Character Tracker</title>
+<title>WoW Classic -- Character Tracker</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -556,7 +800,7 @@ HTML = r"""
 html{font-size:15px}
 body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
 
-/* ── header ── */
+/* -- header -- */
 .site-header{
   background:linear-gradient(180deg,#060810 0%,#0e1220 100%);
   border-bottom:2px solid var(--gold-dim);
@@ -566,7 +810,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .site-header .sub{color:var(--dim);font-size:.8rem;margin-top:.2rem}
 .logo{font-size:1.9rem;line-height:1}
 
-/* ── controls ── */
+/* -- controls -- */
 .controls{
   background:var(--surface);border-bottom:1px solid var(--border);
   padding:.65rem 1.5rem;display:flex;gap:.65rem;flex-wrap:wrap;align-items:center
@@ -579,7 +823,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .controls select:focus,.controls input:focus{outline:1px solid var(--gold-dim)}
 .flex-sep{flex:1}
 
-/* ── summary bar ── */
+/* -- summary bar -- */
 .summary{
   background:var(--surface2);border-bottom:1px solid var(--border);
   padding:.55rem 1.5rem;display:flex;gap:2.5rem;flex-wrap:wrap;align-items:center
@@ -587,12 +831,12 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .sp .v{font-size:1rem;font-weight:700;color:var(--gold)}
 .sp .l{font-size:.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
 
-/* ── grid ── */
+/* -- grid -- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:.9rem;padding:1.1rem 1.5rem}
 .realm-hdr{grid-column:1/-1;font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);padding:.5rem 0 .15rem;border-bottom:1px solid var(--border)}
 .realm-hdr b{color:var(--text);font-weight:600}
 
-/* ── card ── */
+/* -- card -- */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:7px;overflow:hidden;transition:transform .14s,box-shadow .14s;cursor:pointer}
 .card:hover{transform:translateY(-3px);box-shadow:0 8px 28px #00000060}
 .card-bar{height:4px}
@@ -618,8 +862,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .pbar-sec{height:100%;border-radius:3px;background:linear-gradient(90deg,#10405a,#207090)}
 .quests details{margin-top:0}
 .quests summary{font-size:.77rem;color:var(--dim);cursor:pointer;user-select:none;list-style:none;display:flex;align-items:center;gap:.3rem}
-.quests summary::before{content:'▸';font-size:.6rem;transition:transform .15s}
-details[open] summary::before{content:'▾'}
+.quests summary::before{content:'\25B8';font-size:.6rem;transition:transform .15s}
+details[open] summary::before{content:'\25BE'}
 .quest-list{margin:.3rem 0 0 1.1rem;list-style:disc}
 .quest-list li{font-size:.73rem;padding:.08rem 0}
 .badge{display:inline-block;font-size:.63rem;padding:.12rem .38rem;border-radius:3px;text-transform:uppercase;letter-spacing:.05em}
@@ -628,7 +872,7 @@ details[open] summary::before{content:'▾'}
 .click-hint{font-size:.68rem;color:var(--dim);text-align:center;padding:.3rem 0 0}
 .no-res{grid-column:1/-1;text-align:center;padding:3rem;color:var(--dim);font-size:.95rem}
 
-/* ── modal overlay ── */
+/* -- modal overlay -- */
 #overlay{
   position:fixed;inset:0;background:#000000b0;z-index:500;
   display:none;align-items:flex-start;justify-content:center;
@@ -654,8 +898,8 @@ details[open] summary::before{content:'▾'}
 .modal-close:hover{color:var(--text);border-color:var(--text)}
 
 /* modal tabs */
-.modal-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 1.1rem;background:var(--surface2)}
-.tab-btn{padding:.55rem .9rem;font-size:.8rem;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;background:none;border-left:none;border-right:none;border-top:none}
+.modal-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 1.1rem;background:var(--surface2);overflow-x:auto}
+.tab-btn{padding:.55rem .9rem;font-size:.8rem;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;background:none;border-left:none;border-right:none;border-top:none;white-space:nowrap}
 .tab-btn.active{color:var(--gold);border-bottom-color:var(--gold)}
 .tab-btn:hover:not(.active){color:var(--text)}
 
@@ -697,14 +941,41 @@ details[open] summary::before{content:'▾'}
 .zone-hdr{font-size:.78rem;font-weight:700;color:var(--gold);padding:.2rem 0;border-bottom:1px solid var(--border);margin-bottom:.25rem}
 .sz-item{font-size:.72rem;color:var(--dim);padding:.1rem 0 .1rem .6rem;border-left:2px solid #252b42}
 .sz-item::before{content:'• '}
+
+/* achievements panel */
+.ach-summary{font-size:.78rem;color:var(--dim);margin-bottom:.75rem}
+.ach-summary b{color:var(--gold)}
+.ach-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.45rem}
+.ach-item{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:.45rem .65rem}
+.ach-name{font-size:.78rem;font-weight:600;color:var(--text)}
+.ach-date{font-size:.67rem;color:var(--dim);margin-top:.15rem}
+
+/* inventory panel */
+.inv-section-title{font-size:.78rem;font-weight:700;color:var(--gold);text-transform:uppercase;letter-spacing:.07em;margin:.75rem 0 .4rem;padding-bottom:.2rem;border-bottom:1px solid var(--border)}
+.inv-section-title:first-child{margin-top:0}
+.inv-bags-grid{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
+@media(max-width:500px){.inv-bags-grid{grid-template-columns:1fr}}
+.inv-bag{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:.55rem .75rem}
+.inv-bag-name{font-size:.72rem;font-weight:700;color:var(--text);margin-bottom:.35rem;display:flex;justify-content:space-between}
+.inv-bag-meta{font-size:.65rem;color:var(--dim)}
+.inv-item{font-size:.75rem;padding:.12rem 0;border-bottom:1px solid #1a1e2c}
+.inv-item:last-child{border:none}
+.inv-count{color:var(--dim);font-size:.68rem}
+/* quality colors */
+.q-poor{color:#9d9d9d}
+.q-common{color:#e8e0c8}
+.q-uncommon{color:#1eff00}
+.q-rare{color:#0070dd}
+.q-epic{color:#a335ee}
+.q-legendary{color:#ff8000}
 </style>
 </head>
 <body>
 
 <header class="site-header">
-  <div class="logo">⚔️</div>
+  <div class="logo">&#9876;&#65039;</div>
   <div>
-    <h1>WoW Classic — Character Tracker</h1>
+    <h1>WoW Classic -- Character Tracker</h1>
     <div class="sub" id="gen-time"></div>
   </div>
 </header>
@@ -716,16 +987,16 @@ details[open] summary::before{content:'▾'}
   <select id="fClass" onchange="render()"><option value="">All Classes</option></select>
   <label>Sort</label>
   <select id="sSort" onchange="render()">
-    <option value="level">Level ↓</option>
-    <option value="name">Name A→Z</option>
+    <option value="level">Level (High to Low)</option>
+    <option value="name">Name A to Z</option>
     <option value="realm">Realm</option>
     <option value="played">Played Time</option>
     <option value="money">Wealth</option>
     <option value="last_login">Last Login</option>
   </select>
   <div class="flex-sep"></div>
-  <label>🔍</label>
-  <input type="text" id="sSearch" placeholder="Search name…" oninput="render()" style="width:140px">
+  <label>Search</label>
+  <input type="text" id="sSearch" placeholder="Search name..." oninput="render()" style="width:140px">
 </div>
 
 <div class="summary" id="summary"></div>
@@ -745,7 +1016,7 @@ const CHARS = __CHARS__;
 const CC    = __CLASS_COLORS__;
 const MAX_LEVEL = __MAX_LEVEL__;
 
-/* ── init ── */
+/* -- init -- */
 (function(){
   document.getElementById('gen-time').textContent = 'Generated __GEN_TIME__';
   const realms  = [...new Set(CHARS.map(c=>c.realm))].sort();
@@ -757,7 +1028,28 @@ const MAX_LEVEL = __MAX_LEVEL__;
   render();
 })();
 
-/* ── grid render ── */
+/* -- sort key helper -- */
+function sortKey(c, sf){
+  switch(sf){
+    case 'level':      return [-c.level, c.name];
+    case 'name':       return [c.name];
+    case 'realm':      return [c.realm, c.name];
+    case 'played':     return [-c.played];
+    case 'money':      return [-c.money];
+    case 'last_login': return [-c.last_login];
+  }
+  return [c.name];
+}
+function cmpArrays(a, b){
+  for(let i=0;i<Math.max(a.length,b.length);i++){
+    const av=a[i]??0, bv=b[i]??0;
+    if(av<bv)return -1;
+    if(av>bv)return 1;
+  }
+  return 0;
+}
+
+/* -- grid render -- */
 function render(){
   const rf=document.getElementById('fRealm').value;
   const cf=document.getElementById('fClass').value;
@@ -769,17 +1061,20 @@ function render(){
     if(q&&!c.name.toLowerCase().includes(q))return false;
     return true;
   });
-  list.sort((a,b)=>{
-    switch(sf){
-      case 'level':      return b.level-a.level||a.name.localeCompare(b.name);
-      case 'name':       return a.name.localeCompare(b.name);
-      case 'realm':      return a.realm.localeCompare(b.realm)||a.name.localeCompare(b.name);
-      case 'played':     return b.played-a.played;
-      case 'money':      return b.money-a.money;
-      case 'last_login': return b.last_login-a.last_login;
-    }
-    return 0;
-  });
+
+  // When showing all realms: keep realms grouped, apply chosen sort within each group.
+  // When a single realm is selected: just sort by chosen key.
+  if(!rf){
+    // Sort by (realm, chosen_sort_key) so realms stay contiguous
+    list.sort((a,b)=>{
+      const rc=a.realm.localeCompare(b.realm);
+      if(rc!==0)return rc;
+      return cmpArrays(sortKey(a,sf),sortKey(b,sf));
+    });
+  } else {
+    list.sort((a,b)=>cmpArrays(sortKey(a,sf),sortKey(b,sf)));
+  }
+
   const totalCopper=CHARS.reduce((s,c)=>s+c.money,0);
   const most=CHARS.reduce((a,b)=>a.played>b.played?a:b,CHARS[0]);
   document.getElementById('summary').innerHTML=`
@@ -838,7 +1133,7 @@ function buildCard(c,idx){
   if(c.active_quests&&c.active_quests.length){
     const ql=c.active_quests.map(q=>`<li>${q}</li>`).join('');
     questHtml=`<div class="quests"><details>
-      <summary>📋 ${c.active_quests.length} active quest${c.active_quests.length>1?'s':''}</summary>
+      <summary>&#128203; ${c.active_quests.length} active quest${c.active_quests.length>1?'s':''}</summary>
       <ul class="quest-list">${ql}</ul>
     </details></div>`;
   }
@@ -859,20 +1154,20 @@ function buildCard(c,idx){
         ${rPct?`<div class="xp-rest" style="left:${xpPct}%;width:${rPct}%"></div>`:''}
         <div class="xp-txt">${xpPct}% XP${rPct?` +${rPct}% rested`:''}</div>
       </div>`:''}
-      ${c.guild?`<div class="ir"><span class="ico">🏰</span><span class="v">${c.guild}${c.guild_rank?` <span style="color:var(--dim);font-size:.72em">(${c.guild_rank})</span>`:''}</span></div>`:''}
-      ${c.zone?`<div class="ir"><span class="ico">📍</span><span class="v">${c.zone}</span></div>`:''}
-      ${c.money?`<div class="ir"><span class="ico">💰</span><span class="v">${moneyHtml(c.money_obj)}</span></div>`:''}
-      ${c.played?`<div class="ir"><span class="ico">⏱</span><span class="v">${c.played_fmt} played</span></div>`:''}
-      ${c.avg_ilvl>=1?`<div class="ir"><span class="ico">🛡</span><span class="v">Avg ilvl ${c.avg_ilvl}</span></div>`:''}
-      ${c.last_login?`<div class="ir"><span class="ico">🕐</span><span class="v">Last seen ${c.last_login_fmt}</span></div>`:''}
+      ${c.guild?`<div class="ir"><span class="ico">&#127984;</span><span class="v">${c.guild}${c.guild_rank?` <span style="color:var(--dim);font-size:.72em">(${c.guild_rank})</span>`:''}</span></div>`:''}
+      ${c.zone?`<div class="ir"><span class="ico">&#128205;</span><span class="v">${c.zone}</span></div>`:''}
+      ${c.money?`<div class="ir"><span class="ico">&#128176;</span><span class="v">${moneyHtml(c.money_obj)}</span></div>`:''}
+      ${c.played?`<div class="ir"><span class="ico">&#9201;</span><span class="v">${c.played_fmt} played</span></div>`:''}
+      ${c.avg_ilvl>=1?`<div class="ir"><span class="ico">&#128737;</span><span class="v">Avg ilvl ${c.avg_ilvl}</span></div>`:''}
+      ${c.last_login?`<div class="ir"><span class="ico">&#128336;</span><span class="v">Last seen ${c.last_login_fmt}</span></div>`:''}
       ${profHtml}
       ${questHtml}
-      <div class="click-hint">${hasDetail?'Click for full details →':'Click for details'}</div>
+      <div class="click-hint">${hasDetail?'Click for full details':'Click for details'}</div>
     </div>`;
   return card;
 }
 
-/* ── modal ── */
+/* -- modal -- */
 let _activeTab='overview';
 function openModal(idx){
   const c=CHARS[idx];
@@ -883,13 +1178,17 @@ function openModal(idx){
       <div class="modal-hdr-name" style="color:${cc}">${c.name} <span style="color:var(--dim);font-size:.8rem;font-weight:400">Lv ${c.level}</span></div>
       <div class="modal-hdr-sub">${c.race||''} ${c.class_display||''} &bull; ${c.realm}${c.guild?` &bull; ${c.guild}`:''}</div>
     </div>
-    <button class="modal-close" onclick="closeModal()">✕</button>`;
+    <button class="modal-close" onclick="closeModal()">&#x2715;</button>`;
   const ab=c.auto_bio||{};
   const tabs=[
     {id:'overview', label:'Overview'},
     ...(ab.events&&ab.events.length?[{id:'timeline',label:`Timeline (${ab.event_count||ab.events.length})`}]:[]),
     ...(ab.zones_visited&&Object.keys(ab.zones_visited).length?[{id:'zones',label:`Zones (${Object.keys(ab.zones_visited).length})`}]:[]),
+    ...(c.achievements&&c.achievements.completed&&c.achievements.completed.length?[{id:'achievements',label:`Achievements (${c.achievements.completed.length})`}]:[]),
+    ...(c.containers?[{id:'inventory',label:'Inventory'}]:[]),
   ];
+  // If active tab doesn't exist for this char, reset to overview
+  if(!tabs.find(t=>t.id===_activeTab))_activeTab='overview';
   document.getElementById('modal-tabs').innerHTML=tabs.map(t=>
     `<button class="tab-btn${t.id===_activeTab?' active':''}" onclick="switchTab('${t.id}',${idx})" data-tab="${t.id}">${t.label}</button>`
   ).join('');
@@ -905,15 +1204,18 @@ function switchTab(id,idx){
   _activeTab=id;
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
   renderTabContent(id,CHARS[idx]);
+  if(id==='timeline')setTimeout(renderTlList,0);
 }
 function renderTabContent(tab,c){
   const body=document.getElementById('modal-body');
-  if(tab==='overview') body.innerHTML=buildOverview(c);
-  else if(tab==='timeline') body.innerHTML=buildTimeline(c);
-  else if(tab==='zones') body.innerHTML=buildZones(c);
+  if(tab==='overview')       body.innerHTML=buildOverview(c);
+  else if(tab==='timeline')  body.innerHTML=buildTimeline(c);
+  else if(tab==='zones')     body.innerHTML=buildZones(c);
+  else if(tab==='achievements') body.innerHTML=buildAchievements(c);
+  else if(tab==='inventory') body.innerHTML=buildInventory(c);
 }
 
-/* ── Overview tab ── */
+/* -- Overview tab -- */
 function buildOverview(c){
   const profs=Object.entries(c.professions||{});
   const pri=profs.filter(([,p])=>p.primary);
@@ -935,10 +1237,10 @@ function buildOverview(c){
   return `<div class="ov-grid">
     <div class="ov-section">
       <div class="ov-title">Character</div>
-      <div class="ov-row"><span class="ov-lbl">Class</span><span class="ov-val">${c.class_display||'—'}</span></div>
-      <div class="ov-row"><span class="ov-lbl">Race</span><span class="ov-val">${c.race||'—'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Class</span><span class="ov-val">${c.class_display||'&mdash;'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Race</span><span class="ov-val">${c.race||'&mdash;'}</span></div>
       <div class="ov-row"><span class="ov-lbl">Level</span><span class="ov-val">${c.level}</span></div>
-      <div class="ov-row"><span class="ov-lbl">Faction</span><span class="ov-val">${c.faction||'—'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Faction</span><span class="ov-val">${c.faction||'&mdash;'}</span></div>
       <div class="ov-row"><span class="ov-lbl">Realm</span><span class="ov-val">${c.realm}</span></div>
       ${c.guild?`<div class="ov-row"><span class="ov-lbl">Guild</span><span class="ov-val">${c.guild}</span></div>`:''}
       ${c.guild_rank?`<div class="ov-row"><span class="ov-lbl">Rank</span><span class="ov-val">${c.guild_rank}</span></div>`:''}
@@ -951,6 +1253,7 @@ function buildOverview(c){
       ${c.money?`<div class="ov-row"><span class="ov-lbl">Gold</span><span class="ov-val">${moneyHtml(c.money_obj)}</span></div>`:''}
       ${c.bind?`<div class="ov-row"><span class="ov-lbl">Hearthstone</span><span class="ov-val">${c.bind}</span></div>`:''}
       ${c.last_login?`<div class="ov-row"><span class="ov-lbl">Last Login</span><span class="ov-val">${c.last_login_fmt}</span></div>`:''}
+      ${questCount?`<div class="ov-row"><span class="ov-lbl">Quests Completed</span><span class="ov-val">${questCount}</span></div>`:''}
     </div>
     ${questCount||bossCount||zoneCount?`<div class="ov-section">
       <div class="ov-title">Lifetime Stats (AutoBiographer)</div>
@@ -970,14 +1273,14 @@ function buildOverview(c){
   </div>`;
 }
 
-/* ── Timeline tab ── */
+/* -- Timeline tab -- */
 const TL_FILTERS=['levelup','quest','boss','guild_join','guild_leave','guild_rank','zone','skill','rep','bg_enter'];
 const TL_LABELS={
   levelup:'Level Up', quest:'Quests', boss:'Bosses',
   guild_join:'Guild', guild_leave:'Guild', guild_rank:'Guild',
   zone:'Travel', skill:'Skills', rep:'Reputation', bg_enter:'Battleground'
 };
-const TL_ICO={levelup:'⬆',quest:'✅',boss:'💀',guild_join:'🏰',guild_leave:'🏳',guild_rank:'🎖',zone:'🗺',skill:'📖',rep:'⚔',bg_enter:'⚔',bg_end:'⚔',spell:'✨'};
+const TL_ICO={levelup:'^',quest:'[Q]',boss:'[X]',guild_join:'[G]',guild_leave:'[G]',guild_rank:'[G]',zone:'[Z]',skill:'[S]',rep:'[R]',bg_enter:'[BG]',bg_end:'[BG]',spell:'[*]'};
 let _tlFilters=new Set(['levelup','quest','boss','guild_join','guild_leave','guild_rank','zone','skill','rep']);
 let _tlCharIdx=null;
 function buildTimeline(c){
@@ -1004,18 +1307,18 @@ function renderTlList(){
   list.innerHTML=`<div class="tl-count">${filtered.length} events</div><div class="tl-wrap">${filtered.map(e=>tlItemHtml(e)).join('')}</div>`;
 }
 function tlItemHtml(e){
-  const ico=TL_ICO[e.k]||'•';
+  const ico=TL_ICO[e.k]||'*';
   const ts=e.ts?new Date(e.ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
   let text='', extra='', cls='';
   switch(e.k){
     case 'levelup': text=`<b>Reached Level ${e.lvl}</b>`; cls='tl-levelup'; break;
-    case 'quest':   text=e.title||'Quest completed'; extra=`<span class="tl-xp">+${e.xp.toLocaleString()} XP${e.gold?` &nbsp;💰${Math.floor(e.gold/10000)}g${Math.floor((e.gold%10000)/100)}s`:''}`;break;
+    case 'quest':   text=e.title||'Quest completed'; extra=`<span class="tl-xp">+${e.xp.toLocaleString()} XP${e.gold?` &nbsp;${Math.floor(e.gold/10000)}g${Math.floor((e.gold%10000)/100)}s`:''}`;break;
     case 'boss':    text=`Killed: <b>${e.boss}</b>`; cls='tl-boss'; break;
     case 'guild_join': text=`Joined guild: <b>${e.guild}</b>`; cls='tl-guild'; break;
     case 'guild_leave': text=`Left guild: <b>${e.guild}</b>`; cls='tl-guild'; break;
-    case 'guild_rank': text=`Guild rank → <b>${e.rank}</b>`; cls='tl-guild'; break;
+    case 'guild_rank': text=`Guild rank: <b>${e.rank}</b>`; cls='tl-guild'; break;
     case 'zone':    text=`Entered: ${e.zone}`; break;
-    case 'skill':   text=`${e.skill} → <b>${e.lvl}</b>`; break;
+    case 'skill':   text=`${e.skill}: <b>${e.lvl}</b>`; break;
     case 'rep':     text=`${e.faction}: <b>${e.standing}</b>`; break;
     case 'bg_enter': text='Entered Battleground'; break;
     default: text=e.k;
@@ -1024,7 +1327,7 @@ function tlItemHtml(e){
   </div>${ts?`<div class="tl-meta">${ts}</div>`:''}</div></div>`;
 }
 
-/* ── Zones tab ── */
+/* -- Zones tab -- */
 function buildZones(c){
   const zv=c.auto_bio?.zones_visited||{};
   const zones=Object.entries(zv).sort((a,b)=>a[0].localeCompare(b[0]));
@@ -1039,24 +1342,73 @@ function buildZones(c){
     <div class="zones-wrap">${blocks}</div>`;
 }
 
+/* -- Achievements tab -- */
+function buildAchievements(c){
+  const ach=c.achievements;
+  if(!ach||!ach.completed||!ach.completed.length){
+    return '<div style="color:var(--dim);padding:1rem">No achievement data available.</div>';
+  }
+  const totalDef=ach.total||143;
+  const done=ach.completed.length;
+  const items=ach.completed.map(a=>{
+    const ds=a.ts?new Date(a.ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
+    return `<div class="ach-item">
+      <div class="ach-name">${a.name}</div>
+      ${ds?`<div class="ach-date">${ds}</div>`:''}
+    </div>`;
+  }).join('');
+  return `<div class="ach-summary"><b>${done}</b> / ${totalDef} completed</div>
+    <div class="ach-grid">${items}</div>`;
+}
+
+/* -- Inventory tab -- */
+function buildInventory(c){
+  const ct=c.containers;
+  if(!ct)return '<div style="color:var(--dim);padding:1rem">No inventory data available.</div>';
+
+  function itemsHtml(items){
+    if(!items||!items.length)return '<div style="color:var(--dim);font-size:.72rem">Empty</div>';
+    return items.map(it=>`<div class="inv-item q-${it.quality||'common'}">
+      ${it.name}${it.count>1?` <span class="inv-count">x${it.count}</span>`:''}
+    </div>`).join('');
+  }
+
+  let html='';
+
+  // Character bags
+  if(ct.bags&&ct.bags.length){
+    html+='<div class="inv-section-title">Character Bags</div>';
+    html+='<div class="inv-bags-grid">';
+    ct.bags.forEach(bag=>{
+      const totalSlots=bag.size||0;
+      const used=totalSlots-bag.free;
+      html+=`<div class="inv-bag">
+        <div class="inv-bag-name">${bag.name}<span class="inv-bag-meta">${bag.free}/${totalSlots} free</span></div>
+        ${itemsHtml(bag.items)}
+      </div>`;
+    });
+    html+='</div>';
+  }
+
+  // Bank
+  if(ct.bank){
+    html+='<div class="inv-section-title">Bank</div>';
+    const b=ct.bank;
+    const totalSlots=b.size||0;
+    html+=`<div class="inv-bag" style="max-width:100%">
+      <div class="inv-bag-name">Bank<span class="inv-bag-meta">${b.free}/${totalSlots} free</span></div>
+      ${itemsHtml(b.items)}
+    </div>`;
+  }
+
+  return html||'<div style="color:var(--dim);padding:1rem">No inventory data found.</div>';
+}
+
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
 
-// Render timeline list after tab switch settles DOM
-const _origSwitch=switchTab;
-window.switchTab=function(id,idx){
-  _origSwitch(id,idx);
-  if(id==='timeline')setTimeout(renderTlList,0);
-};
-window.openModal=function(idx){
-  const prev=_activeTab;
-  const c=CHARS[idx];
-  const ab=c.auto_bio||{};
-  // If active tab doesn't exist for this char, reset to overview
-  if(_activeTab==='timeline'&&!(ab.events&&ab.events.length))_activeTab='overview';
-  if(_activeTab==='zones'&&!(ab.zones_visited&&Object.keys(ab.zones_visited).length))_activeTab='overview';
-  openModal(idx);
-  if(_activeTab==='timeline')setTimeout(renderTlList,0);
-};
+// Expose openModal globally (allow tab reset logic inline in openModal above)
+window.openModal=openModal;
+window.switchTab=switchTab;
 </script>
 </body>
 </html>
@@ -1064,9 +1416,9 @@ window.openModal=function(idx){
 """
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 def main():
-    print("Gathering WoW character data…")
+    print("Gathering WoW character data...")
     chars = gather()
     print(f"  -> {len(chars)} characters found")
 
@@ -1085,7 +1437,7 @@ def main():
 
     OUTPUT_HTML.write_text(html, encoding="utf-8")
     print(f"\nDone! Dashboard written to: {OUTPUT_HTML}")
-    print("Open wow_tracker.html in any browser.")
+    print("Open index.html in any browser.")
     print("Re-run this script after logging in with new characters.")
 
 

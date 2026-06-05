@@ -161,6 +161,13 @@ class LuaParser:
         self._skip()
         return self._tbl() if self._ch() == "{" else {}
 
+    @classmethod
+    def parse_table_at(cls, text: str, pos: int) -> dict:
+        """Parse a Lua table starting at pos (must point at '{')."""
+        inst = cls.__new__(cls)
+        inst.s, inst.p, inst.n = text, pos, len(text)
+        return inst._tbl()
+
 
 def _load(path: Path) -> dict:
     if not path.exists():
@@ -181,6 +188,123 @@ def _skillet_who(path: Path) -> dict:
     if not m:
         return {}
     return {k: v for k, v in re.findall(r'\["(\w+)"\]\s*=\s*"([^"]*)"', m.group(1))}
+
+
+def _parse_all_vars(text: str) -> dict:
+    """Parse every top-level  VARNAME = { ... }  assignment in a Lua file."""
+    result = {}
+    for m in re.finditer(r'^([A-Z][A-Z0-9_]*)\s*=\s*(\{)', text, re.MULTILINE):
+        varname = m.group(1)
+        try:
+            result[varname] = LuaParser.parse_table_at(text, m.start(2))
+        except Exception:
+            pass
+    return result
+
+
+# AutoBiographer event type/subtype → human label --------------------------------
+_AB_TYPES = {
+    (2,  6):  "levelup",
+    (12, 8):  "quest",
+    (7,  0):  "boss",
+    (4,  3):  "guild_join",
+    (4,  4):  "guild_leave",
+    (4,  5):  "guild_rank",
+    (8,  12): "zone",
+    (13, 9):  "skill",
+    (18, 13): "rep",
+    (0,  14): "bg_enter",
+    (0,  15): "bg_end",
+    (14, 10): "spell",
+}
+
+
+def _parse_autobiographer(path: Path) -> dict | None:
+    """Extract timeline events, zones, and character info from AutoBiographer.lua."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    vars_ = _parse_all_vars(text)
+    result: dict = {}
+
+    # ── INFO_CHAR ─────────────────────────────────────────────────────────────
+    info = vars_.get("AUTOBIOGRAPHER_INFO_CHAR") or {}
+    if isinstance(info, dict):
+        result["zone"]       = info.get("CurrentZone", "")
+        result["sub_zone"]   = info.get("CurrentSubZone", "")
+        result["guild"]      = info.get("GuildName", "")
+        result["guild_rank"] = info.get("GuildRankName", "")
+        result["played"]     = int(info.get("LastTotalTimePlayed", 0) or 0)
+
+    # ── CATALOGS_CHAR — zones explored ────────────────────────────────────────
+    catalogs = vars_.get("AUTOBIOGRAPHER_CATALOGS_CHAR") or {}
+    sz_cat = catalogs.get("SubZoneCatalog") if isinstance(catalogs, dict) else {}
+    if isinstance(sz_cat, dict):
+        zones_map: dict[str, list[str]] = {}
+        for sz_name, sz_data in sz_cat.items():
+            if isinstance(sz_data, dict) and sz_data.get("HasEntered") and isinstance(sz_name, str):
+                zone = str(sz_data.get("ZoneName", "Unknown"))
+                zones_map.setdefault(zone, []).append(sz_name)
+        result["zones_visited"] = {z: sorted(subzones) for z, subzones in sorted(zones_map.items())}
+
+    # ── EVENTS_CHAR — timeline ────────────────────────────────────────────────
+    events_tbl = vars_.get("AUTOBIOGRAPHER_EVENTS_CHAR") or {}
+    if isinstance(events_tbl, dict):
+        timeline = []
+        last_zone = None
+        for _, ev in sorted(events_tbl.items(), key=lambda x: x[0] if isinstance(x[0], int) else 0):
+            if not isinstance(ev, dict):
+                continue
+            t  = ev.get("Type")
+            st = ev.get("SubType")
+            ts = int(ev.get("Timestamp", 0) or 0)
+            ek = _AB_TYPES.get((t, st))
+            if not ek:
+                continue
+
+            # Skip consecutive duplicate zone entries
+            if ek == "zone":
+                zone_name = ev.get("ZoneName", "")
+                if zone_name == last_zone:
+                    continue
+                last_zone = zone_name
+            else:
+                last_zone = None
+
+            entry: dict = {"k": ek, "ts": ts}
+            if ek == "levelup":
+                entry["lvl"] = int(ev.get("LevelNum", 0) or 0)
+            elif ek == "quest":
+                entry["title"] = str(ev.get("QuestTitle", ""))
+                entry["xp"]    = int(ev.get("XpGained", 0) or 0)
+                entry["gold"]  = int(ev.get("MoneyGained", 0) or 0)
+            elif ek == "boss":
+                entry["boss"] = str(ev.get("BossName", ""))
+            elif ek in ("guild_join", "guild_leave"):
+                entry["guild"] = str(ev.get("GuildName", ""))
+            elif ek == "guild_rank":
+                entry["rank"] = str(ev.get("GuildRankName", ""))
+            elif ek == "zone":
+                entry["zone"] = str(ev.get("ZoneName", ""))
+            elif ek == "skill":
+                entry["skill"] = str(ev.get("SkillName", ""))
+                entry["lvl"]   = int(ev.get("SkillLevel", 0) or 0)
+            elif ek == "rep":
+                entry["faction"]  = str(ev.get("Faction", ""))
+                entry["standing"] = str(ev.get("ReputationLevel", ""))
+            elif ek == "spell":
+                entry["spell_id"] = int(ev.get("SpellId", 0) or 0)
+
+            timeline.append(entry)
+
+        result["events"]       = timeline
+        result["event_count"]  = len(events_tbl)
+
+    return result or None
 
 
 # ─── Data aggregation ──────────────────────────────────────────────────────────
@@ -290,6 +414,7 @@ def gather() -> list[dict]:
     # The WTF structure has a subfolder per realm under the account directory.
     # Each realm folder contains per-character subfolders with their own SavedVariables.
     # We scan every realm subfolder dynamically so new realms are picked up automatically.
+    # Even for DataStore characters we still enrich with AutoBiographer event data.
     print("  Scanning per-realm character folders…")
     for realm_dir in sorted(WOW_ACCOUNT_DIR.iterdir()):
         if not realm_dir.is_dir() or realm_dir.name == "SavedVariables":
@@ -298,38 +423,53 @@ def gather() -> list[dict]:
         for cdir in sorted(realm_dir.iterdir()):
             if not cdir.is_dir():
                 continue
+            sv_dir = cdir / "SavedVariables"
             # Try Skillet first for class/race/faction detail
-            who = _skillet_who(cdir / "SavedVariables" / "Skillet-Classic.lua")
+            who = _skillet_who(sv_dir / "Skillet-Classic.lua")
             name = who.get("player", "") or cdir.name  # fall back to folder name
             ck = f"{realm}|{name}"
-            if ck in chars:
-                continue  # already captured by DataStore — richer data wins
-            cls = who.get("classFile", "").upper()
-            source = "Skillet" if who.get("player") else "FolderName"
-            chars[ck] = {
-                "name": name,
-                "realm": realm,
-                "level": 1,
-                "class": cls,
-                "class_display": CLASS_NAMES.get(cls, ""),
-                "race": RACE_NAMES.get(who.get("raceFile", ""), who.get("raceFile", "")),
-                "faction": who.get("faction", "Alliance"),
-                "money": 0,
-                "played": 0,
-                "zone": "",
-                "sub_zone": "",
-                "guild": "",
-                "guild_rank": "",
-                "xp": 0,
-                "xp_max": 1,
-                "rest_xp": 0,
-                "last_login": 0,
-                "bind": "",
-                "professions": {},
-                "avg_ilvl": 0.0,
-                "active_quests": [],
-                "source": source,
-            }
+
+            # Add stub only if not already captured by DataStore
+            if ck not in chars:
+                cls = who.get("classFile", "").upper()
+                source = "Skillet" if who.get("player") else "FolderName"
+                chars[ck] = {
+                    "name": name,
+                    "realm": realm,
+                    "level": 1,
+                    "class": cls,
+                    "class_display": CLASS_NAMES.get(cls, ""),
+                    "race": RACE_NAMES.get(who.get("raceFile", ""), who.get("raceFile", "")),
+                    "faction": who.get("faction", "Alliance"),
+                    "money": 0,
+                    "played": 0,
+                    "zone": "",
+                    "sub_zone": "",
+                    "guild": "",
+                    "guild_rank": "",
+                    "xp": 0,
+                    "xp_max": 1,
+                    "rest_xp": 0,
+                    "last_login": 0,
+                    "bind": "",
+                    "professions": {},
+                    "avg_ilvl": 0.0,
+                    "active_quests": [],
+                    "source": source,
+                }
+
+            # Always enrich with AutoBiographer (available for ALL chars regardless of DataStore)
+            ab = _parse_autobiographer(sv_dir / "AutoBiographer.lua")
+            if ab:
+                chars[ck]["auto_bio"] = ab
+                # Fill in zone/guild/played from AB if DataStore didn't have them
+                if not chars[ck].get("zone") and ab.get("zone"):
+                    chars[ck]["zone"] = ab["zone"]
+                if not chars[ck].get("guild") and ab.get("guild"):
+                    chars[ck]["guild"]      = ab["guild"]
+                    chars[ck]["guild_rank"] = ab.get("guild_rank", "")
+                if not chars[ck].get("played") and ab.get("played"):
+                    chars[ck]["played"] = ab["played"]
 
     # ── DataStore profileKeys fallback (catches chars with no Characters data) ─
     # A character can appear in profileKeys but have no entry in global.Characters
@@ -398,7 +538,8 @@ def fmt_date(ts: int) -> str:
 
 
 # ─── HTML template ─────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html>
+HTML = r"""
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -415,20 +556,17 @@ HTML = r"""<!DOCTYPE html>
 html{font-size:15px}
 body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
 
-/* header */
+/* ── header ── */
 .site-header{
   background:linear-gradient(180deg,#060810 0%,#0e1220 100%);
   border-bottom:2px solid var(--gold-dim);
   padding:1.1rem 1.5rem;display:flex;align-items:center;gap:1rem
 }
-.site-header h1{
-  font-size:1.45rem;font-weight:700;letter-spacing:.04em;
-  color:var(--gold);text-shadow:0 0 18px #c9a22740
-}
+.site-header h1{font-size:1.45rem;font-weight:700;letter-spacing:.04em;color:var(--gold);text-shadow:0 0 18px #c9a22740}
 .site-header .sub{color:var(--dim);font-size:.8rem;margin-top:.2rem}
 .logo{font-size:1.9rem;line-height:1}
 
-/* controls */
+/* ── controls ── */
 .controls{
   background:var(--surface);border-bottom:1px solid var(--border);
   padding:.65rem 1.5rem;display:flex;gap:.65rem;flex-wrap:wrap;align-items:center
@@ -441,7 +579,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .controls select:focus,.controls input:focus{outline:1px solid var(--gold-dim)}
 .flex-sep{flex:1}
 
-/* summary bar */
+/* ── summary bar ── */
 .summary{
   background:var(--surface2);border-bottom:1px solid var(--border);
   padding:.55rem 1.5rem;display:flex;gap:2.5rem;flex-wrap:wrap;align-items:center
@@ -449,51 +587,28 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .sp .v{font-size:1rem;font-weight:700;color:var(--gold)}
 .sp .l{font-size:.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
 
-/* grid */
-.grid{
-  display:grid;
-  grid-template-columns:repeat(auto-fill,minmax(275px,1fr));
-  gap:.9rem;padding:1.1rem 1.5rem
-}
-.realm-hdr{
-  grid-column:1/-1;font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;
-  color:var(--dim);padding:.5rem 0 .15rem;border-bottom:1px solid var(--border)
-}
+/* ── grid ── */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:.9rem;padding:1.1rem 1.5rem}
+.realm-hdr{grid-column:1/-1;font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);padding:.5rem 0 .15rem;border-bottom:1px solid var(--border)}
 .realm-hdr b{color:var(--text);font-weight:600}
 
-/* card */
-.card{
-  background:var(--surface);border:1px solid var(--border);border-radius:7px;
-  overflow:hidden;transition:transform .14s,box-shadow .14s
-}
-.card:hover{transform:translateY(-2px);box-shadow:0 8px 28px #00000055}
+/* ── card ── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:7px;overflow:hidden;transition:transform .14s,box-shadow .14s;cursor:pointer}
+.card:hover{transform:translateY(-3px);box-shadow:0 8px 28px #00000060}
 .card-bar{height:4px}
-.card-head{
-  padding:.8rem 1rem .6rem;border-bottom:1px solid var(--border);
-}
+.card-head{padding:.8rem 1rem .6rem;border-bottom:1px solid var(--border)}
 .card-lvl{float:right;font-size:1.25rem;font-weight:800;line-height:1.15}
 .card-name{font-size:1.05rem;font-weight:700;letter-spacing:.025em}
 .card-sub{font-size:.75rem;color:var(--dim);margin-top:.15rem}
 .card-body{padding:.7rem 1rem;display:flex;flex-direction:column;gap:.5rem}
-
-/* xp bar */
 .xp-wrap{position:relative;height:13px;background:#141822;border-radius:3px;overflow:hidden}
 .xp-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#2a4f1a,#5db832)}
 .xp-rest{position:absolute;top:0;height:100%;background:rgba(90,50,200,.3);border-radius:0 3px 3px 0}
-.xp-txt{
-  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  font-size:.62rem;color:#ffffffaa;font-weight:600
-}
-
-/* info rows */
+.xp-txt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:.62rem;color:#ffffffaa;font-weight:600}
 .ir{display:flex;gap:.45rem;align-items:flex-start;font-size:.8rem}
 .ir .ico{width:1.1em;text-align:center;flex-shrink:0;margin-top:.05em}
 .ir .v{flex:1;line-height:1.35}
-.gg{color:#ffd700;font-weight:600}
-.gs{color:#c8c8c8}
-.gc{color:#b06830}
-
-/* professions */
+.gg{color:#ffd700;font-weight:600}.gs{color:#c8c8c8}.gc{color:#b06830}
 .profs-lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.35rem}
 .prof-row{margin-bottom:.32rem}
 .prof-top{font-size:.76rem;display:flex;justify-content:space-between;align-items:baseline}
@@ -501,24 +616,87 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 .prof-bar-bg{height:5px;background:#141822;border-radius:3px;overflow:hidden;margin-top:2px}
 .pbar-pri{height:100%;border-radius:3px;background:linear-gradient(90deg,#8a4010,#c97830)}
 .pbar-sec{height:100%;border-radius:3px;background:linear-gradient(90deg,#10405a,#207090)}
-
-/* quests */
 .quests details{margin-top:0}
 .quests summary{font-size:.77rem;color:var(--dim);cursor:pointer;user-select:none;list-style:none;display:flex;align-items:center;gap:.3rem}
 .quests summary::before{content:'▸';font-size:.6rem;transition:transform .15s}
 details[open] summary::before{content:'▾'}
 .quest-list{margin:.3rem 0 0 1.1rem;list-style:disc}
 .quest-list li{font-size:.73rem;padding:.08rem 0}
-
-/* badges */
-.badge{
-  display:inline-block;font-size:.63rem;padding:.12rem .38rem;border-radius:3px;
-  text-transform:uppercase;letter-spacing:.05em
-}
+.badge{display:inline-block;font-size:.63rem;padding:.12rem .38rem;border-radius:3px;text-transform:uppercase;letter-spacing:.05em}
 .badge-limited{color:#a07020;border:1px solid #5a3b0c;background:#1e1608}
 .badge-ds{color:#3a7a4a;border:1px solid #1a4025;background:#0e1a12}
-
+.click-hint{font-size:.68rem;color:var(--dim);text-align:center;padding:.3rem 0 0}
 .no-res{grid-column:1/-1;text-align:center;padding:3rem;color:var(--dim);font-size:.95rem}
+
+/* ── modal overlay ── */
+#overlay{
+  position:fixed;inset:0;background:#000000b0;z-index:500;
+  display:none;align-items:flex-start;justify-content:center;
+  padding:2vh 1rem;overflow-y:auto;
+}
+#overlay.open{display:flex}
+#modal{
+  background:var(--surface);border:1px solid var(--gold-dim);border-radius:10px;
+  width:100%;max-width:920px;min-height:200px;
+  box-shadow:0 20px 60px #00000090;margin:auto;
+  display:flex;flex-direction:column;
+}
+.modal-hdr{
+  padding:.85rem 1.1rem;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:.8rem;flex-shrink:0;position:sticky;top:0;
+  background:var(--surface);border-radius:10px 10px 0 0;z-index:1;
+}
+.modal-hdr-bar{width:6px;height:42px;border-radius:3px;flex-shrink:0}
+.modal-hdr-info{flex:1}
+.modal-hdr-name{font-size:1.25rem;font-weight:700}
+.modal-hdr-sub{font-size:.8rem;color:var(--dim);margin-top:.1rem}
+.modal-close{background:none;border:1px solid var(--border);color:var(--dim);padding:.2rem .65rem;border-radius:5px;cursor:pointer;font-size:1.1rem;line-height:1}
+.modal-close:hover{color:var(--text);border-color:var(--text)}
+
+/* modal tabs */
+.modal-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 1.1rem;background:var(--surface2)}
+.tab-btn{padding:.55rem .9rem;font-size:.8rem;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;background:none;border-left:none;border-right:none;border-top:none}
+.tab-btn.active{color:var(--gold);border-bottom-color:var(--gold)}
+.tab-btn:hover:not(.active){color:var(--text)}
+
+/* modal panels */
+.modal-body{padding:1rem 1.1rem;flex:1}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+
+/* overview panel */
+.ov-grid{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
+@media(max-width:540px){.ov-grid{grid-template-columns:1fr}}
+.ov-section{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:.7rem .9rem}
+.ov-title{font-size:.68rem;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);margin-bottom:.5rem}
+.ov-row{display:flex;justify-content:space-between;font-size:.8rem;padding:.15rem 0;border-bottom:1px solid #1a1e2c}
+.ov-row:last-child{border:none}
+.ov-lbl{color:var(--dim)}
+.ov-val{font-weight:600;text-align:right;max-width:60%}
+
+/* timeline panel */
+.tl-wrap{max-height:55vh;overflow-y:auto;display:flex;flex-direction:column;gap:.3rem;padding-right:.2rem}
+.tl-item{display:flex;gap:.55rem;align-items:flex-start;padding:.35rem .5rem;border-radius:5px;background:var(--surface2);border:1px solid transparent}
+.tl-item.tl-levelup{border-color:#2a4a1a;background:#0e1a0a}
+.tl-item.tl-boss{border-color:#4a1a1a;background:#1a0a0a}
+.tl-item.tl-guild{border-color:#1a2a4a;background:#0a0e1a}
+.tl-ico{width:1.4em;text-align:center;flex-shrink:0;margin-top:.05em;font-size:.95rem}
+.tl-main{flex:1}
+.tl-text{font-size:.8rem;line-height:1.35}
+.tl-meta{font-size:.67rem;color:var(--dim);margin-top:.1rem}
+.tl-xp{font-size:.7rem;color:#5db832}
+.tl-filter{display:flex;gap:.4rem;flex-wrap:wrap;padding:.5rem 0;border-bottom:1px solid var(--border);margin-bottom:.6rem}
+.tf-btn{font-size:.72rem;padding:.18rem .5rem;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--dim);cursor:pointer}
+.tf-btn.on{background:#1a2040;border-color:#3a5090;color:#9ab0f0}
+.tl-count{font-size:.72rem;color:var(--dim);margin-bottom:.5rem}
+
+/* zones panel */
+.zones-wrap{columns:2;column-gap:1rem}
+@media(max-width:500px){.zones-wrap{columns:1}}
+.zone-block{break-inside:avoid;margin-bottom:.7rem}
+.zone-hdr{font-size:.78rem;font-weight:700;color:var(--gold);padding:.2rem 0;border-bottom:1px solid var(--border);margin-bottom:.25rem}
+.sz-item{font-size:.72rem;color:var(--dim);padding:.1rem 0 .1rem .6rem;border-left:2px solid #252b42}
+.sz-item::before{content:'• '}
 </style>
 </head>
 <body>
@@ -533,13 +711,9 @@ details[open] summary::before{content:'▾'}
 
 <div class="controls">
   <label>Realm</label>
-  <select id="fRealm" onchange="render()">
-    <option value="">All Realms</option>
-  </select>
+  <select id="fRealm" onchange="render()"><option value="">All Realms</option></select>
   <label>Class</label>
-  <select id="fClass" onchange="render()">
-    <option value="">All Classes</option>
-  </select>
+  <select id="fClass" onchange="render()"><option value="">All Classes</option></select>
   <label>Sort</label>
   <select id="sSort" onchange="render()">
     <option value="level">Level ↓</option>
@@ -557,39 +731,47 @@ details[open] summary::before{content:'▾'}
 <div class="summary" id="summary"></div>
 <div class="grid"   id="grid"></div>
 
+<!-- Detail modal -->
+<div id="overlay" onclick="if(event.target===this)closeModal()">
+  <div id="modal">
+    <div class="modal-hdr" id="modal-hdr"></div>
+    <div class="modal-tabs" id="modal-tabs"></div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const CHARS = __CHARS__;
 const CC    = __CLASS_COLORS__;
 const MAX_LEVEL = __MAX_LEVEL__;
 
-/* init filters */
-(function initFilters(){
+/* ── init ── */
+(function(){
   document.getElementById('gen-time').textContent = 'Generated __GEN_TIME__';
   const realms  = [...new Set(CHARS.map(c=>c.realm))].sort();
   const classes = [...new Set(CHARS.map(c=>c.class).filter(Boolean))].sort();
   const rs = document.getElementById('fRealm');
   realms.forEach(r=>{const o=document.createElement('option');o.value=r;o.textContent=r;rs.appendChild(o)});
   const cs = document.getElementById('fClass');
-  classes.forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c.charAt(0)+c.slice(1).toLowerCase();cs.appendChild(o)});
+  classes.forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c[0]+c.slice(1).toLowerCase();cs.appendChild(o)});
   render();
 })();
 
+/* ── grid render ── */
 function render(){
-  const rf = document.getElementById('fRealm').value;
-  const cf = document.getElementById('fClass').value;
-  const sf = document.getElementById('sSort').value;
-  const q  = document.getElementById('sSearch').value.toLowerCase();
-
-  let list = CHARS.filter(c=>{
-    if(rf && c.realm!==rf) return false;
-    if(cf && c.class!==cf) return false;
-    if(q  && !c.name.toLowerCase().includes(q)) return false;
+  const rf=document.getElementById('fRealm').value;
+  const cf=document.getElementById('fClass').value;
+  const sf=document.getElementById('sSort').value;
+  const q =document.getElementById('sSearch').value.toLowerCase();
+  let list=CHARS.filter(c=>{
+    if(rf&&c.realm!==rf)return false;
+    if(cf&&c.class!==cf)return false;
+    if(q&&!c.name.toLowerCase().includes(q))return false;
     return true;
   });
-
   list.sort((a,b)=>{
     switch(sf){
-      case 'level':      return b.level-a.level || a.name.localeCompare(b.name);
+      case 'level':      return b.level-a.level||a.name.localeCompare(b.name);
       case 'name':       return a.name.localeCompare(b.name);
       case 'realm':      return a.realm.localeCompare(b.realm)||a.name.localeCompare(b.name);
       case 'played':     return b.played-a.played;
@@ -598,77 +780,60 @@ function render(){
     }
     return 0;
   });
-
-  /* summary */
-  const totalCopper = CHARS.reduce((s,c)=>s+c.money,0);
-  const totalGold   = Math.floor(totalCopper/10000);
-  const maxLvl      = Math.max(...CHARS.map(c=>c.level));
-  const most        = CHARS.reduce((a,b)=>a.played>b.played?a:b, CHARS[0]);
+  const totalCopper=CHARS.reduce((s,c)=>s+c.money,0);
+  const most=CHARS.reduce((a,b)=>a.played>b.played?a:b,CHARS[0]);
   document.getElementById('summary').innerHTML=`
     <div class="sp"><span class="v">${CHARS.length}</span><span class="l">Characters</span></div>
-    <div class="sp"><span class="v">${totalGold.toLocaleString()}<span style="font-size:.7em;color:#8a7020">g</span></span><span class="l">Total Gold</span></div>
-    <div class="sp"><span class="v">${maxLvl}</span><span class="l">Highest Level</span></div>
+    <div class="sp"><span class="v">${Math.floor(totalCopper/10000).toLocaleString()}<span style="font-size:.7em;color:#8a7020">g</span></span><span class="l">Total Gold</span></div>
+    <div class="sp"><span class="v">${Math.max(...CHARS.map(c=>c.level))}</span><span class="l">Highest Level</span></div>
     <div class="sp"><span class="v">${most?.name||''}</span><span class="l">Most Played</span></div>
-    <div class="sp"><span class="v">${list.length}</span><span class="l">Showing</span></div>
-  `;
-
-  const grid = document.getElementById('grid');
+    <div class="sp"><span class="v">${list.length}</span><span class="l">Showing</span></div>`;
+  const grid=document.getElementById('grid');
   grid.innerHTML='';
-
-  if(!list.length){
-    grid.innerHTML='<div class="no-res">No characters match your filters.</div>';
-    return;
-  }
-
+  if(!list.length){grid.innerHTML='<div class="no-res">No characters match.</div>';return;}
   let lastRealm=null;
-  list.forEach(c=>{
-    if(!rf && c.realm!==lastRealm){
+  list.forEach((c,i)=>{
+    const globalIdx=CHARS.indexOf(c);
+    if(!rf&&c.realm!==lastRealm){
       lastRealm=c.realm;
       const cnt=list.filter(x=>x.realm===c.realm).length;
-      const h=document.createElement('div');
-      h.className='realm-hdr';
+      const h=document.createElement('div');h.className='realm-hdr';
       h.innerHTML=`${c.realm} &nbsp;<b>${cnt} character${cnt!==1?'s':''}</b>`;
       grid.appendChild(h);
     }
-    grid.appendChild(buildCard(c));
+    grid.appendChild(buildCard(c,globalIdx));
   });
 }
 
-function clr(cls){ return CC[cls]||'#aaaaaa'; }
-
+function clr(cls){return CC[cls]||'#aaaaaa';}
 function moneyHtml(m){
   let s='';
-  if(m.g) s+=`<span class="gg">${m.g.toLocaleString()}g</span> `;
-  if(m.s||m.g) s+=`<span class="gs">${m.s}s</span> `;
+  if(m.g)s+=`<span class="gg">${m.g.toLocaleString()}g</span> `;
+  if(m.s||m.g)s+=`<span class="gs">${m.s}s</span> `;
   s+=`<span class="gc">${m.c}c</span>`;
   return s.trim()||'<span class="gc">0c</span>';
 }
 
-function buildCard(c){
-  const cc   = clr(c.class);
-  const atMax = c.level >= MAX_LEVEL;
-  const xpPct = atMax ? 100 : Math.round(c.xp/c.xp_max*100);
-  const rPct  = atMax||!c.rest_xp ? 0 : Math.min(100-xpPct, Math.round(c.rest_xp/c.xp_max*100));
-
-  /* professions */
-  const profs = Object.entries(c.professions||{});
-  const pri   = profs.filter(([,p])=>p.primary);
-  const sec   = profs.filter(([,p])=>p.secondary);
+function buildCard(c,idx){
+  const cc=clr(c.class);
+  const atMax=c.level>=MAX_LEVEL;
+  const xpPct=atMax?100:Math.round(c.xp/c.xp_max*100);
+  const rPct=atMax||!c.rest_xp?0:Math.min(100-xpPct,Math.round(c.rest_xp/c.xp_max*100));
+  const profs=Object.entries(c.professions||{});
+  const pri=profs.filter(([,p])=>p.primary);
+  const sec=profs.filter(([,p])=>p.secondary);
   let profHtml='';
   if(profs.length){
     profHtml='<div><div class="profs-lbl">Professions</div>';
     [...pri,...sec].forEach(([name,p])=>{
       const pct=p.max>0?Math.round(p.rank/p.max*100):0;
-      const bcls=p.primary?'pbar-pri':'pbar-sec';
       profHtml+=`<div class="prof-row">
         <div class="prof-top">${name}<span class="prof-rk">${p.rank}/${p.max}</span></div>
-        <div class="prof-bar-bg"><div class="${bcls}" style="width:${pct}%"></div></div>
+        <div class="prof-bar-bg"><div class="${p.primary?'pbar-pri':'pbar-sec'}" style="width:${pct}%"></div></div>
       </div>`;
     });
     profHtml+='</div>';
   }
-
-  /* active quests */
   let questHtml='';
   if(c.active_quests&&c.active_quests.length){
     const ql=c.active_quests.map(q=>`<li>${q}</li>`).join('');
@@ -677,9 +842,10 @@ function buildCard(c){
       <ul class="quest-list">${ql}</ul>
     </details></div>`;
   }
-
+  const hasDetail=!!(c.auto_bio&&(c.auto_bio.events||c.auto_bio.zones_visited));
   const card=document.createElement('div');
   card.className='card';
+  card.onclick=()=>openModal(idx);
   card.innerHTML=`
     <div class="card-bar" style="background:${cc}"></div>
     <div class="card-head">
@@ -694,30 +860,207 @@ function buildCard(c){
         <div class="xp-txt">${xpPct}% XP${rPct?` +${rPct}% rested`:''}</div>
       </div>`:''}
       ${c.guild?`<div class="ir"><span class="ico">🏰</span><span class="v">${c.guild}${c.guild_rank?` <span style="color:var(--dim);font-size:.72em">(${c.guild_rank})</span>`:''}</span></div>`:''}
-      ${c.zone?`<div class="ir"><span class="ico">📍</span><span class="v">${c.zone}${c.sub_zone?` — ${c.sub_zone}`:''}</span></div>`:''}
+      ${c.zone?`<div class="ir"><span class="ico">📍</span><span class="v">${c.zone}</span></div>`:''}
       ${c.money?`<div class="ir"><span class="ico">💰</span><span class="v">${moneyHtml(c.money_obj)}</span></div>`:''}
       ${c.played?`<div class="ir"><span class="ico">⏱</span><span class="v">${c.played_fmt} played</span></div>`:''}
-      ${c.avg_ilvl>=1?`<div class="ir"><span class="ico">🛡</span><span class="v">Avg Item Level ${c.avg_ilvl}</span></div>`:''}
-      ${c.bind?`<div class="ir"><span class="ico">🔒</span><span class="v">Bound: ${c.bind}</span></div>`:''}
+      ${c.avg_ilvl>=1?`<div class="ir"><span class="ico">🛡</span><span class="v">Avg ilvl ${c.avg_ilvl}</span></div>`:''}
       ${c.last_login?`<div class="ir"><span class="ico">🕐</span><span class="v">Last seen ${c.last_login_fmt}</span></div>`:''}
       ${profHtml}
       ${questHtml}
-      <div class="ir">
-        <span class="ico"></span>
-        <span class="badge ${c.source==='DataStore'?'badge-ds':'badge-limited'}">${
-          c.source==='DataStore'?'Full data':
-          c.source==='Skillet'?'Class known':
-          c.source==='FolderName'?'Name only':
-          'No addon data'
-        }</span>
-      </div>
-    </div>
-  `;
+      <div class="click-hint">${hasDetail?'Click for full details →':'Click for details'}</div>
+    </div>`;
   return card;
 }
+
+/* ── modal ── */
+let _activeTab='overview';
+function openModal(idx){
+  const c=CHARS[idx];
+  const cc=clr(c.class);
+  document.getElementById('modal-hdr').innerHTML=`
+    <div class="modal-hdr-bar" style="background:${cc}"></div>
+    <div class="modal-hdr-info">
+      <div class="modal-hdr-name" style="color:${cc}">${c.name} <span style="color:var(--dim);font-size:.8rem;font-weight:400">Lv ${c.level}</span></div>
+      <div class="modal-hdr-sub">${c.race||''} ${c.class_display||''} &bull; ${c.realm}${c.guild?` &bull; ${c.guild}`:''}</div>
+    </div>
+    <button class="modal-close" onclick="closeModal()">✕</button>`;
+  const ab=c.auto_bio||{};
+  const tabs=[
+    {id:'overview', label:'Overview'},
+    ...(ab.events&&ab.events.length?[{id:'timeline',label:`Timeline (${ab.event_count||ab.events.length})`}]:[]),
+    ...(ab.zones_visited&&Object.keys(ab.zones_visited).length?[{id:'zones',label:`Zones (${Object.keys(ab.zones_visited).length})`}]:[]),
+  ];
+  document.getElementById('modal-tabs').innerHTML=tabs.map(t=>
+    `<button class="tab-btn${t.id===_activeTab?' active':''}" onclick="switchTab('${t.id}',${idx})" data-tab="${t.id}">${t.label}</button>`
+  ).join('');
+  renderTabContent(_activeTab,c);
+  document.getElementById('overlay').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeModal(){
+  document.getElementById('overlay').classList.remove('open');
+  document.body.style.overflow='';
+}
+function switchTab(id,idx){
+  _activeTab=id;
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
+  renderTabContent(id,CHARS[idx]);
+}
+function renderTabContent(tab,c){
+  const body=document.getElementById('modal-body');
+  if(tab==='overview') body.innerHTML=buildOverview(c);
+  else if(tab==='timeline') body.innerHTML=buildTimeline(c);
+  else if(tab==='zones') body.innerHTML=buildZones(c);
+}
+
+/* ── Overview tab ── */
+function buildOverview(c){
+  const profs=Object.entries(c.professions||{});
+  const pri=profs.filter(([,p])=>p.primary);
+  const sec=profs.filter(([,p])=>p.secondary);
+  let profRows='';
+  [...pri,...sec].forEach(([name,p])=>{
+    const pct=p.max>0?Math.round(p.rank/p.max*100):0;
+    profRows+=`<div class="prof-row">
+      <div class="prof-top">${name}<span class="prof-rk">${p.rank}/${p.max}</span></div>
+      <div class="prof-bar-bg"><div class="${p.primary?'pbar-pri':'pbar-sec'}" style="width:${pct}%"></div></div>
+    </div>`;
+  });
+  const ab=c.auto_bio||{};
+  const zoneCount=ab.zones_visited?Object.keys(ab.zones_visited).length:0;
+  const subZoneCount=ab.zones_visited?Object.values(ab.zones_visited).reduce((s,a)=>s+a.length,0):0;
+  const questCount=(ab.events||[]).filter(e=>e.k==='quest').length;
+  const bossCount=(ab.events||[]).filter(e=>e.k==='boss').length;
+  const levelsTracked=(ab.events||[]).filter(e=>e.k==='levelup').length;
+  return `<div class="ov-grid">
+    <div class="ov-section">
+      <div class="ov-title">Character</div>
+      <div class="ov-row"><span class="ov-lbl">Class</span><span class="ov-val">${c.class_display||'—'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Race</span><span class="ov-val">${c.race||'—'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Level</span><span class="ov-val">${c.level}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Faction</span><span class="ov-val">${c.faction||'—'}</span></div>
+      <div class="ov-row"><span class="ov-lbl">Realm</span><span class="ov-val">${c.realm}</span></div>
+      ${c.guild?`<div class="ov-row"><span class="ov-lbl">Guild</span><span class="ov-val">${c.guild}</span></div>`:''}
+      ${c.guild_rank?`<div class="ov-row"><span class="ov-lbl">Rank</span><span class="ov-val">${c.guild_rank}</span></div>`:''}
+    </div>
+    <div class="ov-section">
+      <div class="ov-title">Progress</div>
+      ${c.played?`<div class="ov-row"><span class="ov-lbl">Time Played</span><span class="ov-val">${c.played_fmt}</span></div>`:''}
+      ${c.zone?`<div class="ov-row"><span class="ov-lbl">Last Zone</span><span class="ov-val">${c.zone}</span></div>`:''}
+      ${c.avg_ilvl>=1?`<div class="ov-row"><span class="ov-lbl">Avg Item Level</span><span class="ov-val">${c.avg_ilvl}</span></div>`:''}
+      ${c.money?`<div class="ov-row"><span class="ov-lbl">Gold</span><span class="ov-val">${moneyHtml(c.money_obj)}</span></div>`:''}
+      ${c.bind?`<div class="ov-row"><span class="ov-lbl">Hearthstone</span><span class="ov-val">${c.bind}</span></div>`:''}
+      ${c.last_login?`<div class="ov-row"><span class="ov-lbl">Last Login</span><span class="ov-val">${c.last_login_fmt}</span></div>`:''}
+    </div>
+    ${questCount||bossCount||zoneCount?`<div class="ov-section">
+      <div class="ov-title">Lifetime Stats (AutoBiographer)</div>
+      ${questCount?`<div class="ov-row"><span class="ov-lbl">Quests Completed</span><span class="ov-val">${questCount}</span></div>`:''}
+      ${bossCount?`<div class="ov-row"><span class="ov-lbl">Bosses Killed</span><span class="ov-val">${bossCount}</span></div>`:''}
+      ${zoneCount?`<div class="ov-row"><span class="ov-lbl">Zones Explored</span><span class="ov-val">${zoneCount} zones / ${subZoneCount} areas</span></div>`:''}
+      ${levelsTracked?`<div class="ov-row"><span class="ov-lbl">Levels Tracked</span><span class="ov-val">${levelsTracked}</span></div>`:''}
+    </div>`:''}
+    ${profs.length?`<div class="ov-section">
+      <div class="ov-title">Professions</div>
+      ${profRows}
+    </div>`:''}
+    ${c.active_quests&&c.active_quests.length?`<div class="ov-section" style="grid-column:1/-1">
+      <div class="ov-title">Active Quests (${c.active_quests.length})</div>
+      ${c.active_quests.map(q=>`<div class="ov-row"><span class="ov-val" style="color:var(--text)">${q}</span></div>`).join('')}
+    </div>`:''}
+  </div>`;
+}
+
+/* ── Timeline tab ── */
+const TL_FILTERS=['levelup','quest','boss','guild_join','guild_leave','guild_rank','zone','skill','rep','bg_enter'];
+const TL_LABELS={
+  levelup:'Level Up', quest:'Quests', boss:'Bosses',
+  guild_join:'Guild', guild_leave:'Guild', guild_rank:'Guild',
+  zone:'Travel', skill:'Skills', rep:'Reputation', bg_enter:'Battleground'
+};
+const TL_ICO={levelup:'⬆',quest:'✅',boss:'💀',guild_join:'🏰',guild_leave:'🏳',guild_rank:'🎖',zone:'🗺',skill:'📖',rep:'⚔',bg_enter:'⚔',bg_end:'⚔',spell:'✨'};
+let _tlFilters=new Set(['levelup','quest','boss','guild_join','guild_leave','guild_rank','zone','skill','rep']);
+let _tlCharIdx=null;
+function buildTimeline(c){
+  _tlCharIdx=CHARS.indexOf(c);
+  const filterBtns=TL_FILTERS.map(f=>`<button class="tf-btn${_tlFilters.has(f)?' on':''}" onclick="toggleFilter('${f}')">${TL_LABELS[f]||f}</button>`).join('');
+  return `<div class="tl-filter">${filterBtns}</div><div id="tl-list"></div>`;
+}
+function toggleFilter(f){
+  if(_tlFilters.has(f))_tlFilters.delete(f);else _tlFilters.add(f);
+  document.querySelectorAll('.tf-btn').forEach(b=>{
+    const bf=b.getAttribute('onclick').match(/'(\w+)'/)?.[1];
+    if(bf)b.classList.toggle('on',_tlFilters.has(bf));
+  });
+  renderTlList();
+}
+function renderTlList(){
+  const c=CHARS[_tlCharIdx];
+  if(!c||!c.auto_bio?.events)return;
+  const events=[...c.auto_bio.events].reverse();
+  const filtered=events.filter(e=>_tlFilters.has(e.k));
+  const list=document.getElementById('tl-list');
+  if(!list)return;
+  if(!filtered.length){list.innerHTML='<div style="color:var(--dim);padding:1rem;font-size:.82rem">No events match the active filters.</div>';return;}
+  list.innerHTML=`<div class="tl-count">${filtered.length} events</div><div class="tl-wrap">${filtered.map(e=>tlItemHtml(e)).join('')}</div>`;
+}
+function tlItemHtml(e){
+  const ico=TL_ICO[e.k]||'•';
+  const ts=e.ts?new Date(e.ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
+  let text='', extra='', cls='';
+  switch(e.k){
+    case 'levelup': text=`<b>Reached Level ${e.lvl}</b>`; cls='tl-levelup'; break;
+    case 'quest':   text=e.title||'Quest completed'; extra=`<span class="tl-xp">+${e.xp.toLocaleString()} XP${e.gold?` &nbsp;💰${Math.floor(e.gold/10000)}g${Math.floor((e.gold%10000)/100)}s`:''}`;break;
+    case 'boss':    text=`Killed: <b>${e.boss}</b>`; cls='tl-boss'; break;
+    case 'guild_join': text=`Joined guild: <b>${e.guild}</b>`; cls='tl-guild'; break;
+    case 'guild_leave': text=`Left guild: <b>${e.guild}</b>`; cls='tl-guild'; break;
+    case 'guild_rank': text=`Guild rank → <b>${e.rank}</b>`; cls='tl-guild'; break;
+    case 'zone':    text=`Entered: ${e.zone}`; break;
+    case 'skill':   text=`${e.skill} → <b>${e.lvl}</b>`; break;
+    case 'rep':     text=`${e.faction}: <b>${e.standing}</b>`; break;
+    case 'bg_enter': text='Entered Battleground'; break;
+    default: text=e.k;
+  }
+  return `<div class="tl-item ${cls}"><div class="tl-ico">${ico}</div><div class="tl-main"><div class="tl-text">${text}${extra?`<br>${extra}</span>`:''}
+  </div>${ts?`<div class="tl-meta">${ts}</div>`:''}</div></div>`;
+}
+
+/* ── Zones tab ── */
+function buildZones(c){
+  const zv=c.auto_bio?.zones_visited||{};
+  const zones=Object.entries(zv).sort((a,b)=>a[0].localeCompare(b[0]));
+  if(!zones.length)return '<div style="color:var(--dim);padding:1rem">No zone data available.</div>';
+  const blocks=zones.map(([zone,subzones])=>`
+    <div class="zone-block">
+      <div class="zone-hdr">${zone} <span style="color:var(--dim);font-size:.7em">(${subzones.length})</span></div>
+      ${subzones.map(s=>`<div class="sz-item">${s}</div>`).join('')}
+    </div>`).join('');
+  const total=zones.reduce((s,[,a])=>s+a.length,0);
+  return `<div style="font-size:.75rem;color:var(--dim);margin-bottom:.75rem">${zones.length} zones &bull; ${total} areas explored</div>
+    <div class="zones-wrap">${blocks}</div>`;
+}
+
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+
+// Render timeline list after tab switch settles DOM
+const _origSwitch=switchTab;
+window.switchTab=function(id,idx){
+  _origSwitch(id,idx);
+  if(id==='timeline')setTimeout(renderTlList,0);
+};
+window.openModal=function(idx){
+  const prev=_activeTab;
+  const c=CHARS[idx];
+  const ab=c.auto_bio||{};
+  // If active tab doesn't exist for this char, reset to overview
+  if(_activeTab==='timeline'&&!(ab.events&&ab.events.length))_activeTab='overview';
+  if(_activeTab==='zones'&&!(ab.zones_visited&&Object.keys(ab.zones_visited).length))_activeTab='overview';
+  openModal(idx);
+  if(_activeTab==='timeline')setTimeout(renderTlList,0);
+};
 </script>
 </body>
 </html>
+
 """
 
 

@@ -286,22 +286,24 @@ def gather() -> list[dict]:
                 active.append(str(title))
         chars[ck]["active_quests"] = active
 
-    # ── Defias Pillager – all character folders ───────────────────────────────
-    # Some characters only have AddOns.txt (no SavedVariables); the folder name IS the character name.
-    # For those that do have Skillet, we get class/race/faction too.
-    print("  Defias Pillager (all folders)…")
-    dp_root = WOW_ACCOUNT_DIR / "Defias Pillager"
-    if dp_root.exists():
-        for cdir in sorted(dp_root.iterdir()):
+    # ── Per-realm character folders (Dreamscythe\, Defias Pillager\, Doomhowl\, …) ─
+    # The WTF structure has a subfolder per realm under the account directory.
+    # Each realm folder contains per-character subfolders with their own SavedVariables.
+    # We scan every realm subfolder dynamically so new realms are picked up automatically.
+    print("  Scanning per-realm character folders…")
+    for realm_dir in sorted(WOW_ACCOUNT_DIR.iterdir()):
+        if not realm_dir.is_dir() or realm_dir.name == "SavedVariables":
+            continue
+        realm = realm_dir.name
+        for cdir in sorted(realm_dir.iterdir()):
             if not cdir.is_dir():
                 continue
-            realm = "Defias Pillager"
-            # Try Skillet first for class/race detail
+            # Try Skillet first for class/race/faction detail
             who = _skillet_who(cdir / "SavedVariables" / "Skillet-Classic.lua")
             name = who.get("player", "") or cdir.name  # fall back to folder name
             ck = f"{realm}|{name}"
             if ck in chars:
-                continue
+                continue  # already captured by DataStore — richer data wins
             cls = who.get("classFile", "").upper()
             source = "Skillet" if who.get("player") else "FolderName"
             chars[ck] = {

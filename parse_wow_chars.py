@@ -318,50 +318,468 @@ def _parse_autobiographer(path: Path) -> dict | None:
 
 
 # --- Achievement parsing ------------------------------------------------------
-def _load_achievement_names() -> dict:
+def _load_achievement_names(char_class: str = "", char_faction: str = "Alliance") -> dict:
     """
-    Read AnniversaryAchievements addon files and build a dict of
-    {int_index: "Display Name"} by counting CreateAchievement('AN_XXX') calls
-    in order and mapping each key to its English string from en.lua.
+    Build {achievement_id: display_name} by simulating the AnniversaryAchievements
+    addon's exact registration order.  Achievements without an explicit 6th-argument
+    ID get sequential auto-IDs starting at 1; those with an explicit ID are stored
+    at that index directly.
     """
-    addon_dir = WOW_ADDONS_DIR / "AnniversaryAchievements"
-    ach_lua   = addon_dir / "achievements" / "achievements.lua"
-    en_lua    = addon_dir / "localization" / "en.lua"
-
-    if not ach_lua.exists():
-        print(f"  WARN: achievements.lua not found at {ach_lua}")
-        return {}
-
-    # Read english strings: AN_XXX = "Display Name"
-    en_strings: dict[str, str] = {}
+    en_lua = WOW_ADDONS_DIR / "AnniversaryAchievements" / "localization" / "en.lua"
+    en: dict[str, str] = {}
     if en_lua.exists():
         try:
-            en_text = en_lua.read_text(encoding="utf-8", errors="replace")
-            for m in re.finditer(r"(AN_[A-Z0-9_]+)\s*=\s*'([^']*)'", en_text):
-                en_strings[m.group(1)] = m.group(2)
-        except Exception as e:
-            print(f"  WARN en.lua: {e}")
+            txt = en_lua.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r"(\w+)\s*=\s*'((?:[^'\\]|\\.)*)'", txt):
+                en[m.group(1)] = m.group(2).replace("\\'", "'")
+        except Exception:
+            pass
 
-    # Read achievements.lua: count CreateAchievement('AN_XXX') calls in order
-    ach_names: dict[int, str] = {}
-    try:
-        ach_text = ach_lua.read_text(encoding="utf-8", errors="replace")
-        idx = 1
-        for m in re.finditer(r"CreateAchievement\s*\(\s*['\"]([^'\"]+)['\"]", ach_text):
-            key = m.group(1)
-            display = en_strings.get(key, key)
-            ach_names[idx] = display
-            idx += 1
-    except Exception as e:
-        print(f"  WARN achievements.lua: {e}")
+    def L(key: str, *args) -> str:
+        s = en.get(key, key)
+        if args:
+            try:
+                return s % args
+            except Exception:
+                return s
+        return s
 
-    return ach_names
+    names: dict[int, str] = {}
+    _auto = [0]
+
+    def reg(name: str, explicit: int | None = None) -> int:
+        if explicit is not None:
+            names[explicit] = name
+            return explicit
+        _auto[0] += 1
+        names[_auto[0]] = name
+        return _auto[0]
+
+    cls  = char_class.upper()
+    is_h = char_faction == "Horde"
+    fl   = "H" if is_h else "A"  # faction letter for PvP ranks
+
+    # ── GENERAL ──────────────────────────────────────────────────────────────
+    for i in range(1, 8):                           # Level 10 … 70
+        reg(L("AN_LVL", i * 10))
+    reg(L("AN_BANK"))
+    for i in range(1, 8):                           # mob kills ×7
+        reg(L(f"AN_MOB_KILLS_{i}"))
+    reg(L("AN_UNARMED_SKILL"))
+    reg(L("AN_UNCOMMON_GEAR"))
+    reg(L("AN_RARE_GEAR"))
+    reg(L("AN_EPIC_GEAR"))
+    for sp in (75, 150, 225, 300):
+        reg(L(f"AN_RIDING_{sp}"))
+    for tier in ("T1", "T2", "T3"):                 # class-specific tier sets
+        key = f"AN_{cls}_{tier}"
+        reg(en.get(key, f"{cls or 'Class'} Tier {tier[1]}"))
+    reg(L("AN_DOLCE"))
+
+    # ── QUESTS ───────────────────────────────────────────────────────────────
+    for c in (50, 100, 250, 500, 750, 1000, 1500, 2000):
+        reg(L("AN_QUESTS", c))
+    # daily quests: explicit IDs 567-574
+    for i, c in enumerate((5, 50, 200, 500, 1000, 2500, 5000, 10000)):
+        reg(L("AN_DAILY_QUESTS", c), 567 + i)
+    # quest gold: auto-IDs
+    for c in (5, 10, 25, 50, 100, 250, 500):
+        reg(L(f"AN_QUEST_GOLD{c}"))
+    reg(L("AN_SKELETON_KEY"))
+
+    # Wisdom Keeper Kalimdor then 12 zone quests
+    reg(L("AN_WISDOM_KEEPER_KALIMDOR"))
+    for z in ("DUROTAR", "BARRENS", "STONETALON", "DESOLACE", "THOUSAND_NEEDLES",
+              "DUSTWALLOW", "FELWOOD", "TANARIS", "UNGORO", "AZSHARA",
+              "WINTERSPRING", "SILITHUS"):
+        reg(L("AN_QUESTS_ZONE", en.get(f"{z}_2", z.replace("_", " ").title())))
+
+    # Wisdom Keeper Eastern Kingdoms then 8 zone quests
+    reg(L("AN_WISDOM_KEEPER_EASTERN_KINGDOMS"))
+    for z in ("ARATHI", "STRANGLETHORN_VALLEY", "BADLANDS", "SEARING_GORGE",
+              "BLASTED_LANDS", "WESTERN_PLAGUELANDS", "EASTERN_PLAGUELANDS", "BLACK_ROCK"):
+        reg(L("AN_QUESTS_ZONE", en.get(f"{z}_2", z.replace("_", " ").title())))
+
+    reg(L("AN_WISDOM_KEEPER_AZEROTH"))
+    reg(L("AN_NESINGWARY"))
+
+    # TBC outland quest zones (6 faction pairs + netherstorm + shadowmoon)
+    for z in ("HELLFIRE_PENINSULA", "HELLFIRE_PENINSULA",   # Horde / Alliance
+              "ZANGARMASH",         "ZANGARMASH",
+              "TERROKAR",           "TERROKAR",
+              "NAGRAND",            "NAGRAND",
+              "BLADES_EDGE_MTNS",   "BLADES_EDGE_MTNS",
+              "NETHERSTORM",        "SHADOWMOON"):
+        name_key = f"AN_QUESTS_{z}"
+        reg(en.get(name_key, z.replace("_", " ").title()))
+
+    reg(L("AN_WISDOM_KEEPER_OUTLAND"))  # Horde
+    reg(L("AN_WISDOM_KEEPER_OUTLAND"))  # Alliance
+    reg(L("AN_WISDOM_KEEPER"))          # Horde
+    reg(L("AN_WISDOM_KEEPER"))          # Alliance
+    reg(L("AN_HEMET_QUESTS_NAGRAND"))
+    for att in ("AN_ATTUNE_SHATTERED_HALLS", "AN_ATTUNE_ARCATRAZ",
+                "AN_ATTUNE_KARAZHAN", "AN_ATTUNE_NIGHT_BANE",
+                "AN_ATTUNE_SSC", "AN_ATTUNE_EYE",
+                "AN_ATTUNE_HYJAL", "AN_ATTUNE_BLACK_TEMPLE"):
+        reg(L(att))
+
+    # ── EXPLORATION ──────────────────────────────────────────────────────────
+    reg(L("AN_EXPLORE_AZEROTH"))
+    reg(L("AN_EXPLORE_KALIMDOR"))
+    for a in ("Ashenvale", "Azshara", "Darkshore", "Desolace", "Durotar",
+              "Dustwallow Marsh", "Felwood", "Feralas", "Mulgore", "Silithus",
+              "Stonetalon Mountains", "Tanaris", "Teldrassil", "The Barrens",
+              "Thousand Needles", "Un'Goro Crater", "Winterspring",
+              "Azuremyst Isle", "Bloodmyst Isle"):
+        reg(L("AN_EXPLORE", a))
+    reg(L("AN_EXPLORE_EASTERN_KINGDOMS"))
+    for a in ("Alterac Mountains", "Arathi Highlands", "Badlands", "Blasted Lands",
+              "Burning Steppes", "Deadwind Pass", "Dun Morogh", "Duskwood",
+              "Eastern Plaguelands", "Elwynn Forest", "Hillsbrad Foothills",
+              "Loch Modan", "Redridge Mountains", "Searing Gorge", "Silverpine Forest",
+              "Stranglethorn Vale", "Swamp of Sorrows", "The Hinterlands",
+              "Tirisfal Glades", "Western Plaguelands", "Westfall", "Wetlands",
+              "Eversong Woods", "Ghostlands", "Isle of Quel'Danas"):
+        reg(L("AN_EXPLORE", a))
+    reg(L("AN_LOVE"))
+    reg(L("AN_EXPLORE_OUTLAND"))
+    for a in ("Hellfire Peninsula", "Zangarmarsh", "Terokkar Forest", "Nagrand",
+              "Blade's Edge Mountains", "Netherstorm", "Shadowmoon Valley"):
+        reg(L("AN_EXPLORE", a))
+    reg(L("AN_MIDDLE_RARE"))
+    reg(L("AN_BLOODY_RARE"))
+
+    # ── PVP ──────────────────────────────────────────────────────────────────
+    for i in range(1, 15):          # 14 PvP rank feats (featsOfStrength, auto-IDs)
+        reg(L(f"AN_PVP_RANK_{fl}{i}"))
+    reg(L("AN_PVP_FIRST_KILL"))
+    for c in (10, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500000):
+        reg(L("AN_PVP_KILLS", c))
+    # BG faction reps
+    reg(L("AN_DEFILERS")); reg(L("AN_FROSTWOLF_CLAN")); reg(L("AN_WARSONG_OUTRIDERS"))
+    reg(L("AN_HORDE_PVP_FRACTIONS"))
+    reg(L("AN_LEAGUE_OF_ARATHOR")); reg(L("AN_STORMSPIKE_GUARD")); reg(L("AN_SILVERWING_SENTINELS"))
+    reg(L("AN_ALLIANCE_PVP_FRACTIONS"))
+    # Leader slayers
+    reg(L("AN_BOLVAR_SLAYER")); reg(L("AN_MAGNI_SLAYER")); reg(L("AN_TYRANDE_SLAYER")); reg(L("AN_VELEN_SLAYER"))
+    reg(L("AN_ALLIANCE_KINGS_SLAYER"))
+    reg(L("AN_THRALL_SLAYER")); reg(L("AN_SYLVANAS_SLAYER")); reg(L("AN_CAIRNE_SLAYER")); reg(L("AN_LORTHEMAR_SLAYER"))
+    reg(L("AN_HORDE_KINGS_SLAYER"))
+    reg(L("AN_RACES_KILLER")); reg(L("AN_RACES_KILLER")); reg(L("AN_CLASSES_KILLER"))
+
+    # BG wins: 5 amounts × 4 BGs
+    for bg in ("ALTERAC", "WARSONG", "ARATHI", "EYE"):
+        for n in (1, 5, 10, 25, 50):
+            key = f"AN_{bg}_WIN" if n == 1 else f"AN_{bg}_WINS"
+            reg(en.get(key, f"{bg.title()} Victory"))
+
+    # Alterac stat achievements
+    for counts, typ in (
+        ((5, 10, 25, 40),    "KILLING_BLOWS"),
+        ((1, 2, 3, 4),       "GRAVEYARD_ASSAULT"),
+        ((1, 2, 3, 4),       "GRAVEYARD_DEFEND"),
+        ((1, 2, 3, 4),       "TOWER_ASSAULT"),
+        ((1, 2, 3, 4),       "TOWER_DEFEND"),
+        ((1, 2, 3, 4),       "MINE_CAPTURE"),
+    ):
+        for n in counts:
+            base = f"ALTERAC_{typ}"
+            key  = base if n == 1 and f"AN_{base}" in en else f"{base}S"
+            if n == 1 and f"AN_{base}" in en:
+                reg(en[f"AN_{base}"])
+            else:
+                reg(en.get(f"AN_{key}", f"Alterac {typ.replace('_',' ').title()}"))
+    reg(L("AN_ALTERAC_FAST_WIN"))
+    # Warsong
+    for n in (10, 25, 50, 75): reg(L("AN_WARSONG_KILLS"))
+    for n in (1, 2, 3): reg(en.get("AN_WARSONG_FLAG_CAPTURE" if n == 1 else "AN_WARSONG_FLAG_CAPTURES", "Flag Capture"))
+    for n in (1, 2, 3): reg(en.get("AN_WARSONG_FLAG_RETURN"  if n == 1 else "AN_WARSONG_FLAG_RETURNS",  "Flag Return"))
+    reg(L("AN_WARSONG_FAST_WIN"))
+    # Arathi
+    for n in (1, 2, 3, 4): reg(en.get("AN_ARATHI_BASE_ASSAULT" if n == 1 else "AN_ARATHI_BASE_ASSAULTS", "Base Assault"))
+    for n in (1, 2, 3, 4): reg(en.get("AN_ARATHI_BASE_DEFEND"  if n == 1 else "AN_ARATHI_BASE_DEFENDS",  "Base Defend"))
+    reg(L("AN_ARATHI_CATS"))
+    reg(L("AN_ARATHI_FAST_WIN"))
+    # Career totals (add() function using inner counter)
+    reg(L("AN_ALTERAC_TOWER_DEFEND_TOTAL"))
+    reg(L("AN_ALTERAC_GRAVEYARD_ASSAULT_TOTAL"))
+    reg(L("AN_WARSONG_FLAG_CAPTURE_TOTAL"))
+    reg(L("AN_WARSONG_FLAG_RETURN_TOTAL"))
+    reg(L("AN_ARATHI_BASE_ASSAULT_TOTAL"))
+    reg(L("AN_ARATHI_BASE_DEFEND_TOTAL"))
+    # Explicit IDs
+    reg(L("AN_ARATHI_CLOSE"),   578)
+    reg(L("AN_ARATHI_PERFECT"), 579)
+    # Mounts
+    reg(L("AN_ALTERAC_MOUNT_HORDE"))    # Frostwolf Howler
+    reg(L("AN_ALTERAC_MOUNT_ALLIANCE")) # Stormpike Battle Charger
+    # Eye of the Storm
+    for n in (1, 2, 3): reg(en.get("AN_EYE_CAPTURE" if n == 1 else "AN_EYE_CAPTURES", "Storm Capper"))
+    reg(L("AN_EYE_GLORY")); reg(L("AN_EYE_BERSERK")); reg(L("AN_EYE_IDEAL_VICTORY")); reg(L("AN_EYE_FAST_WIN"))
+    # Explicit
+    reg(L("AN_ALTERAC_AUTOGRAPH"), 577)
+    # Boss / meta
+    reg(L("AN_ALTERAC_BOSS")); reg(L("AN_WARSONG_BOSS")); reg(L("AN_ARATHI_BOSS")); reg(L("AN_EYE_BOSS"))
+    reg(L("AN_BATTLEMASTER"))
+    for n in (10, 25, 50): reg(L("AN_PARTICIPATE_IN_BGS"))
+    for _ in (100, 250, 500, 750, 1000): reg(L("AN_BGS_KILLING_BLOWS"))
+    for _ in (100, 250, 500, 750, 1000): reg(L("AN_BGS_KILLS"))
+    reg(L("AN_GURUBASHI_1")); reg(L("AN_GURUBASHI_2"))
+    reg(L("AN_DUEL"))
+    reg(L("AN_DUELS_10")); reg(L("AN_DUELS_25")); reg(L("AN_DUELS_100"))
+    # Arena: all explicit IDs (580-604)
+    reg(L("AN_ARENA_GLADIATOR"), 580); reg(L("AN_ARENA_DUELIST"),    581)
+    reg(L("AN_ARENA_RIVAL"),     582); reg(L("AN_ARENA_CHALLENGER"), 583)
+    reg(L("AN_ARENA_FIRST_WIN"), 584)
+    for i, _ in enumerate((100, 200, 300), 1):
+        reg(L(f"AN_ARENA_WIN{i}"), 584 + i)
+    reg(L("AN_ARENA_MAPS"),      588); reg(L("AN_ARENA_STREAK"),     589)
+    _aid = 590
+    for bracket in (2, 3, 5):
+        for rating in (1550, 1750, 2000, 2200):
+            reg(L(f"AN_ARENA_{bracket}_{rating}"), _aid); _aid += 1
+    reg(L("AN_ARENA_HOTSTREAK"), 602); reg(L("AN_ARENA_LASTMAN"),    603)
+    reg(L("AN_ARENA_MASTER"),    604)
+
+    # ── PVE ──────────────────────────────────────────────────────────────────
+    # Classic dungeons
+    for key in ("AN_RAGEFIRE_CHASM", "AN_WAILING_CAVERNS", "AN_DEAD_MINES",
+                "AN_SHADOWFANG_KEEP", "AN_BLACKFATHOM_DEEPS", "AN_JAIL",
+                "AN_GNOMREGAN", "AN_RAZORFEN_KRAUL", "AN_SCARLET_MONASTERY",
+                "AN_RAZORFEN_DOWNS", "AN_ULDAMAN", "AN_ZULFARRAK",
+                "AN_MARAUDON", "AN_SUNKEN_TEMPLE"):
+        reg(L(key))
+    reg(L("AN_NEW_EMPEROR")); reg(L("AN_BLACKROCK_DEPTHS")); reg(L("AN_BLACKROCK_PARTY"))
+    reg(L("AN_ARMOR_SWORD")); reg(L("AN_BLACKROCK_DEPTHS_FULL"))
+    reg(L("AN_BLACKROCK_SPIRE_BOTTOM")); reg(L("AN_BLACKROCK_SPIRE_UPPER")); reg(L("AN_BLACKROCK_SPIRE"))
+    reg(L("AN_DIRE_MAUL")); reg(L("AN_STRATHOLME")); reg(L("AN_SCHOLOMANCE"))
+    reg(L("AN_YOUNG_DEFENDER")); reg(L("AN_DEFENDER"))
+    # Classic raids
+    for key in ("AN_ONYXIA", "AN_AQ20", "AN_ZULGURUB", "AN_RAGNAROS",
+                "AN_BLACK_WING_LAIR", "AN_AQ40",
+                "AN_NAXXRAMAS_SPIDERS", "AN_NAXXRAMAS_PLAGUE",
+                "AN_NAXXRAMAS_MILITARY", "AN_NAXXRAMAS_CONSTRUCT", "AN_NAXXRAMAS_LAIR"):
+        reg(L(key))
+    reg(L("AN_NAXXRAMAS_SAPPHIRON"), 540)
+    reg(L("AN_NAXXRAMAS"))
+    reg(L("AN_YOUNG_HERO")); reg(L("AN_BLACKROCK_MASTER")); reg(L("AN_HERO")); reg(L("AN_GREAT_HERO"))
+    # World bosses
+    reg(L("AN_WB_AZUREGOS")); reg(L("AN_WB_KAZZAK"))
+    reg(L("AN_WB_YSONDRE")); reg(L("AN_WB_LETHON")); reg(L("AN_WB_EMERISS")); reg(L("AN_WB_TAERAR"))
+    reg(L("AN_WB_EMERALD_DRAGONS"))
+    # Naxx challenges
+    reg(L("AN_LEEROY")); reg(L("AN_BWL_DUO"))
+    reg(L("AN_ANUBREKHAN_WITHOUT_MOBS")); reg(L("AN_FAERLINA_WITHOUT_MOBS"))
+    reg(L("AN_ARACHNOPHOBIA")); reg(L("AN_FOUR_TOGETHER")); reg(L("AN_SAPPHIRONE_WITH_ALL_ALIVE"))
+    reg(L("AN_HEIGAN_DANCE"),            562)
+    reg(L("AN_PATCHWERK"),               563)
+    reg(L("AN_KELTHUZAD_ABOMINATIONS"),  565)
+    # TBC dungeons: 16 zones × 2 (normal then heroic), builders registered after
+    _tbc = ("hellfire_ramparts", "blood_furnace", "slave_pens", "underbog",
+            "mana_tombs", "auchenai_crypts", "old_hillsbrad", "sethekk_halls",
+            "steamvault", "shadow_labyrinth", "shattered_halls", "black_morass",
+            "botanica", "mechanar", "arcatraz", "magisters_terrace")
+    for z in _tbc:
+        base = L(f"AN_{z.upper()}")
+        reg(base)
+        reg(L("HEROIC_NAME_PATTERN", base))
+    reg(L("AN_TBC_DUNGEONS")); reg(L("AN_TBC_DUNGEONS_HERO"))
+    # TBC world bosses / raids
+    reg(L("AN_RAVEN_LORD"))
+    reg(L("AN_WB_KAZZAK_OUTLAND")); reg(L("AN_WB_DOOMWALKER"))
+    reg(L("AN_KARAZHAN")); reg(L("AN_GRUUL")); reg(L("AN_MAGTHERIDON"))
+    reg(L("AN_TBC_PHASE_1"))
+    reg(L("AN_SSC")); reg(L("AN_TK")); reg(L("AN_TBC_PHASE_2"))
+    reg(L("AN_HYJAL"))
+    reg(L("AN_BT_ENTRANCE")); reg(L("AN_BT_SECOND_WING")); reg(L("AN_BT_LAST_WING"))
+    reg(L("AN_BLACK_TEMPLE")); reg(L("AN_TBC_PHASE_3"))
+    reg(L("AN_ZULAMAN")); reg(L("AN_TBC_PHASE_4"))
+    reg(L("AN_SUNWELL")); reg(L("AN_TBC_PHASE_5"))
+    reg(L("AN_OUTLAND_HERO"),       631)
+    reg(L("AN_OUTLAND_GREAT_HERO"), 632)
+
+    # ── PROFESSIONS ──────────────────────────────────────────────────────────
+    for key in ("AN_PROFS_JOURNEYMAN", "AN_PROFS_EXPERT", "AN_PROFS_ARTISAN",
+                "AN_PROFS_ONE", "AN_PROFS_ONE_OUTLAND"):
+        reg(L(key))
+    reg(L("AN_PROFS_TWO")); reg(L("AN_PROFS_TWO_OUTLAND"))
+    for prof in ("FIRST_AID", "FISHING", "COOKING"):
+        for lvl in ("JOURNEYMAN", "EXPERT", "ARTISAN", "MASTER"):
+            reg(L(f"AN_{prof}_{lvl}"))
+    reg(L("AN_PROFS_SECONDARY")); reg(L("AN_PROFS_SECONDARY_OUTLAND"))
+    for prof in ("FIRST_AID", "FISHING", "COOKING"):
+        reg(L(f"AN_{prof}_OUTLAND_MASTER"))
+    reg(L("AN_PROFS_FIVE")); reg(L("AN_PROFS_FIVE_OUTLAND"))
+    reg(L("AN_STOCKING_UP")); reg(L("AN_STOCKING_UP_2"))
+    reg(L("AN_STOCKING_UP_OUTLAND")); reg(L("AN_STOCKING_UP_2_OUTLAND"))
+    reg(L("AN_BOOTY_BAY_CONTEST")); reg(L("AN_BOOTY_BAY_FISH"))
+    for key in ("AN_FISHING_COLLECTION", "AN_FISHING_WATER", "AN_FISHING_RUM",
+                "AN_FISHING_RING", "AN_FISHING_SKULL"):
+        reg(L(key))
+    for key in ("AN_FISHING_SNAPPER", "AN_FISHING_SEA_BASS", "AN_FISHING_SALMON", "AN_FISHING_LOBSTER"):
+        reg(L(key))
+    reg(L("AN_FISHING_BIG_SIZE"))
+    for c in (25, 50, 100, 250, 500, 1000):
+        reg(L("AN_FISHING_COUNT", c), 516 + (25, 50, 100, 250, 500, 1000).index(c))
+    reg(L("AN_MR_PINCHY"))
+    reg(L("AN_FISHING_OUTLAND_COLLECTION"), 547)
+    reg(L("AN_FISHING_BOOK"),        548)
+    reg(L("AN_TBC_DAILY_FISH"),      549)
+    reg(L("AN_OLD_IRONJAW"),         550)
+    reg(L("AN_OLD_CRAFTY"),          551)
+    reg(L("AN_FISHING_DIPLOMAT"),    552)
+    reg(L("AN_ACCOMPLISHED_ANGLER"), 554)
+    reg(L("AN_SECOND_RING"),         624)
+    for c in (5, 10, 25, 50, 75):
+        reg(L(f"AN_COOKING_RECIPES_{c}"))
+    for key in ("AN_COOKING_SOUP", "AN_COOKING_DESSERT", "AN_COOKING_SQUID", "AN_COOKING_DUMPLINGS"):
+        reg(L(key))
+    reg(L("AN_COOKING_BIG_TABLE"))
+    reg(L("AN_COOKING_CAKE"))
+    reg(L("AN_CAPTAIN_RUMSEY"),    555)
+    reg(L("AN_TBC_DAILY_COOKING"), 556)
+    reg(L("AN_TBC_COOKING_RECIPES"), 557)
+    reg(L("AN_HAIL_CHEF"),         558)
+
+    # ── WORLD EVENTS ─────────────────────────────────────────────────────────
+    reg(L("AN_HALLOWSEND"), 531)
+    if is_h:
+        reg(L("AN_HALLOWSEND_HORDE_QUEST1"),   532)
+        reg(L("AN_HALLOWSEND_HORDE_QUEST2"),   533)
+    else:
+        reg(L("AN_HALLOWSEND_ALLIANCE_QUEST1"), 532)
+        reg(L("AN_HALLOWSEND_ALLIANCE_QUEST2"), 533)
+    reg(L("AN_HALLOWSEND_TREATS"),         534)
+    reg(L("AN_PUMPKIN"),                   535)
+    reg(L("AN_HALLOWSEND_INVOCATION_BUFF"), 536)
+    reg(L("AN_HALLOWSEND_MASK"),           537)
+    reg(L("AN_HALLOWSEND_MASKS"),          538)
+    reg(L("AN_HALLOWSEND_TRANSFORM"),      539)
+    reg(L("AN_WINTERVEIL"),                541)
+    reg(L("AN_WINTERVEIL_METZEN"),         542)
+    reg(L("AN_WINTERVEIL_SMOKEYWOOD"),     543)
+    reg(L("AN_WINTERVEIL_GOURMET"),        544)
+    reg(L("AN_WINTERVEIL_PRESENTS"),       545)
+    if is_h:
+        reg(L("AN_WINTERVEIL_SNOWBALL_HORDE"),    546)
+    else:
+        reg(L("AN_WINTERVEIL_SNOWBALL_ALLIANCE"), 546)
+    reg(L("AN_WINTERVEIL_PVP"),            566)
+    reg(L("AN_VALENTINES"),                605)
+    reg(L("AN_VALENTINES_ROSES"),          606)
+    reg(L("AN_VALENTINES_QUEST"),          607)
+    reg(L("AN_VALENTINES_CHOCOLATES"),     608)
+    reg(L("AN_VALENTINES_DRESS"),          609)
+    reg(L("AN_VALENTINES_PIDO"),           610)
+    reg(L("AN_LUNAR"),                     611)
+    reg(L("AN_LUNAR_COIN"),                612)
+    for i, c in enumerate((5, 10, 25, 50)):
+        reg(L("AN_LUNAR_COINS", c), 613 + i)
+    reg(L("AN_LUNAR_QUEST"),   617)
+    reg(L("AN_LUNAR_CLOTHES"), 618)
+    reg(L("AN_LUNAR_ELDERS_DUNGEONS"),          619)
+    if is_h:
+        reg(L("AN_LUNAR_ELDERS_HORDE"),         620)
+    else:
+        reg(L("AN_LUNAR_ELDERS_ALLIANCE"),       620)
+    reg(L("AN_LUNAR_ELDERS_EASTERN_KINGDOMS"),  621)
+    reg(L("AN_LUNAR_ELDERS_KALIMDOR"),          622)
+    reg(L("AN_NOBLEGARDEN_CLOTHES"), 625)
+    reg(L("AN_NOBLEGARDEN_DRESS"),   626)
+    reg(L("AN_DOLCE"),               627)    # second dolce entry (item-based)
+    reg(L("AN_CHILDREN"),            628)
+    reg(L("AN_CHILDREN_PET"),        629)
+    reg(L("AN_CHILDREN_PETS"),       630)
+    if is_h:
+        reg(L("AN_MIDSUMMER"), 633)
+        reg(L("AN_MIDSUMMER_QUEST1"),                           634)
+        reg(L("AN_MIDSUMMER_DESECRATION_HORDE_KALIMDOR"),       635)
+        reg(L("AN_MIDSUMMER_DESECRATION_HORDE_OUTLAND"),        636)
+        reg(L("AN_MIDSUMMER_DESECRATION_HORDE_EASTERN_KINGDOMS"), 637)
+        reg(L("AN_MIDSUMMER_DESECRATION_HORDE"),                638)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_HORDE_KALIMDOR"),      639)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_HORDE_OUTLAND"),       640)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_HORDE_EASTERN_KINGDOMS"), 641)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_HORDE"),               642)
+    else:
+        reg(L("AN_MIDSUMMER"), 633)
+        reg(L("AN_MIDSUMMER_QUEST1"),                             634)
+        reg(L("AN_MIDSUMMER_DESECRATION_ALLIANCE_KALIMDOR"),      635)
+        reg(L("AN_MIDSUMMER_DESECRATION_ALLIANCE_OUTLAND"),       636)
+        reg(L("AN_MIDSUMMER_DESECRATION_ALLIANCE_EASTERN_KINGDOMS"), 637)
+        reg(L("AN_MIDSUMMER_DESECRATION_ALLIANCE"),               638)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_ALLIANCE_KALIMDOR"),     639)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_ALLIANCE_OUTLAND"),      640)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_ALLIANCE_EASTERN_KINGDOMS"), 641)
+        reg(L("AN_MIDSUMMER_FLAME_KEEPER_ALLIANCE"),              642)
+    reg(L("AN_MIDSUMMER_AHUNE"), 643)
+
+    # ── REPUTATION ───────────────────────────────────────────────────────────
+    for i, c in enumerate((1, 5, 10, 15, 20, 25, 30)):
+        name = L("AN_REPS_1") if c == 1 else f"{c}{L('AN_REPS_X')}"
+        reg(name)
+    if is_h:
+        reg(L("AN_HORDE_REPS"))
+    else:
+        reg(L("AN_ALLIANCE_REPS"))
+    for key in ("AN_HYDRAXIANS", "AN_ZANDALAR_TRIBE", "AN_BROOD_OF_NOZDORMU",
+                "AN_ARGENT_DAWN", "AN_TIMBERMAW_HOLD", "AN_DARKMOON_FAIRE",
+                "AN_THORIUM", "AN_SHENDRALAR"):
+        reg(L(key))
+    reg(L("AN_CENARION"), 576)
+    reg(L("AN_TBC_DUNGEON_REPUTATIONS"))  # Horde
+    reg(L("AN_TBC_DUNGEON_REPUTATIONS"))  # Alliance
+    reg(L("AN_SHATTRATH_REP"))
+    reg(L("AN_CENARION_CIRCLE"))
+    for key in ("AN_OGRILA", "AN_SPOREGGAR", "AN_CONSORTIUM"):
+        reg(L(key))
+    if is_h:
+        reg(L("AN_MAGHAR"))
+    else:
+        reg(L("AN_KURENAI"))
+    reg(L("AN_NETHERWINGS"))
+    reg(L("AN_SKYSHATTERED"))
+    for key in ("AN_AMETHYST_EYE", "AN_SCALE_OF_THE_SANDS",
+                "AN_ASHTONGUE_DEATHSWORN", "AN_SHATTERED_SUN"):
+        reg(L(key))
+    reg(L("AN_SKYGUARD"),    559)
+    reg(L("AN_HIPPOGRYPH"),  560)
+    reg(L("AN_DIPLOMAT"),    564)
+
+    # ── FEATS OF STRENGTH ────────────────────────────────────────────────────
+    for key in ("AN_SULFURAS", "AN_THUNDER_FURY", "AN_BLACK_SCARAB", "AN_RED_SCARAB",
+                "AN_ATIESH", "AN_TIGER_MOUNT", "AN_RAPTOR_MOUNT",
+                "AN_BARON_MOUNT", "AN_SABER_MOUNT"):
+        reg(L(key))
+    reg(L("AN_PIRATES_HAT"),     523)
+    reg(L("AN_WARLOCK_MOUNT"),   524)
+    reg(L("AN_PALADIN_MOUNT"),   525)
+    reg(L("AN_ARGENT_DAWN_TABARD"), 561)
+    reg(L("AN_PREPATCH_QUEST"))
+    reg(L("AN_AZZINOTH"))
+    reg(L("AN_THORIDAL"))
+    reg(L("AN_BEAR_MOUNT"))
+    reg(L("AN_HAWK_MOUNT"))
+    reg(L("AN_ALAR_MOUNT"))
+    reg(L("AN_P3_FIRST_WEEK"))
+    reg(L("AN_FLIGHFORM"),       522)
+    reg(L("AN_HORSEMAN_MOUNT"),  527)
+    reg(L("AN_HERO_SHATTRATH"),  528)
+    reg(L("AN_CHAMPION_NAARU"),  529)
+    reg(L("AN_HAND_ADAL"),       530)
+    reg(L("AN_KRUUL"),           575)
+    reg(L("AN_ATTUMEN_MOUNT"),   623)
+
+    # Remove any placeholder 0-ID entries that may have leaked in
+    names.pop(0, None)
+    return names
 
 
-def _parse_achievements(path: Path, ach_names: dict) -> dict | None:
+def _parse_achievements(path: Path, ach_names: dict, char_class: str = "") -> dict | None:
     """
     Parse AnniversaryAchievements.lua per-character saved vars.
-    CA_LocalData structure: {int_index: {1: bool_completed, 2: timestamp, 3: criteria_dict}}
+    CA_LocalData: {achievement_id: {1: bool_completed, 2: timestamp, 3: criteria}}
     Returns {"completed": [{"name": str, "ts": int}, ...], "total": int}
     """
     if not path.exists():
@@ -377,20 +795,18 @@ def _parse_achievements(path: Path, ach_names: dict) -> dict | None:
         return None
 
     completed = []
-    total = len(ach_names) if ach_names else len(local_data)
+    total = sum(1 for v in ach_names.values() if v and not v.startswith("AN_"))
 
     for idx, entry in local_data.items():
         if not isinstance(entry, dict):
             continue
-        is_completed = entry.get(1)
-        ts = int(entry.get(2, 0) or 0)
-        if is_completed:
-            name = ach_names.get(idx, f"Achievement #{idx}") if ach_names else f"Achievement #{idx}"
-            completed.append({"name": name, "ts": ts})
+        if not entry.get(1):
+            continue
+        ts   = int(entry.get(2, 0) or 0)
+        name = ach_names.get(idx, f"Achievement #{idx}")
+        completed.append({"name": name, "ts": ts})
 
-    # Sort newest-first
     completed.sort(key=lambda x: x["ts"], reverse=True)
-
     return {"completed": completed, "total": total}
 
 
@@ -515,15 +931,66 @@ def _build_char_containers(containers_entry: dict) -> dict:
     return result if result else {}
 
 
+# --- Mailbox parsing ----------------------------------------------------------
+def _parse_mails(path: Path) -> dict | None:
+    """
+    Parse DataStore_Mails.lua and return per-character pending mail.
+    Returns {key: [{"sender": str, "item": str, "count": int, "days": int}, ...]}
+    """
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    vars_ = _parse_all_vars(text)
+    db = vars_.get("DataStore_MailsDB")
+    if not isinstance(db, dict):
+        return None
+    chars_data = (db.get("global") or {}).get("Characters") or {}
+    result: dict = {}
+    for key, info in chars_data.items():
+        if not isinstance(info, dict):
+            continue
+        mails = info.get("Mails")
+        if not isinstance(mails, dict):
+            continue
+        items = []
+        for _, mail in mails.items():
+            if not isinstance(mail, dict):
+                continue
+            link  = mail.get("link", "")
+            name_m  = re.search(r'\[([^\]]+)\]', link) if link else None
+            color_m = re.search(r'\|cff([0-9a-fA-F]{6})', link) if link else None
+            item_name = name_m.group(1) if name_m else ""
+            quality = QUALITY_COLORS.get((color_m.group(1).lower() if color_m else ""), "common")
+            items.append({
+                "sender":       str(mail.get("sender", "")),
+                "item":         item_name,
+                "item_quality": quality,
+                "count":        int(mail.get("count", 1) or 1),
+                "days":         int(mail.get("daysLeft", 0) or 0),
+            })
+        if items:
+            result[key] = items
+    return result or None
+
+
 # --- Data aggregation ---------------------------------------------------------
+_ach_names_cache: dict[tuple, dict] = {}
+
+def _get_ach_names(cls: str, faction: str) -> dict:
+    key = (cls.upper(), faction)
+    if key not in _ach_names_cache:
+        _ach_names_cache[key] = _load_achievement_names(cls, faction)
+    return _ach_names_cache[key]
+
+
 def gather() -> list[dict]:
     chars: dict[str, dict] = {}
 
-    # Load achievement names once at the start
-    print("  Loading achievement names...")
-    ach_names = _load_achievement_names()
-    if ach_names:
-        print(f"    Found {len(ach_names)} achievement definitions")
+    print("  Loading achievement name table...")
 
     # -- DataStore_Characters (core stats) ------------------------------------
     print("  DataStore_Characters...")
@@ -641,6 +1108,18 @@ def gather() -> list[dict]:
             if built:
                 chars[ck]["containers"] = built
 
+    # -- DataStore_Mails (pending mailbox items) --------------------------------
+    print("  DataStore_Mails...")
+    mails_map = _parse_mails(WOW_SAVED_VARS / "DataStore_Mails.lua")
+    if mails_map:
+        for key, items in mails_map.items():
+            p = key.split(".", 2)
+            if len(p) < 3:
+                continue
+            ck = f"{p[1]}|{p[2]}"
+            if ck in chars and items:
+                chars[ck]["mail"] = items
+
     # -- Per-realm character folders -------------------------------------------
     # The WTF structure has a subfolder per realm under the account directory.
     # Each realm folder contains per-character subfolders with their own SavedVariables.
@@ -710,7 +1189,10 @@ def gather() -> list[dict]:
                         if max_lvl > 1:
                             chars[ck]["level"] = max_lvl
 
-            # Parse achievements
+            # Parse achievements (names depend on class + faction)
+            char_cls     = chars[ck].get("class", "")
+            char_faction = chars[ck].get("faction", "Alliance")
+            ach_names    = _get_ach_names(char_cls, char_faction)
             ach = _parse_achievements(sv_dir / "AnniversaryAchievements.lua", ach_names)
             if ach:
                 chars[ck]["achievements"] = ach
@@ -789,6 +1271,7 @@ HTML = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WoW Classic -- Character Tracker</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0c10'/%3E%3Cg stroke='%23c9a227' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cline x1='8' y1='8' x2='24' y2='24' stroke-width='3'/%3E%3Cline x1='24' y1='8' x2='8' y2='24' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='3.5' stroke-width='2' fill='%23c9a227'/%3E%3Cpolygon points='8,5 10,8 8,11 6,8' fill='%23c9a227' stroke='none'/%3E%3Cpolygon points='24,5 26,8 24,11 22,8' fill='%23c9a227' stroke='none'/%3E%3Cpolygon points='8,21 10,24 8,27 6,24' fill='%23c9a227' stroke='none'/%3E%3Cpolygon points='24,21 26,24 24,27 22,24' fill='%23c9a227' stroke='none'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -830,6 +1313,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:1
 }
 .sp .v{font-size:1rem;font-weight:700;color:var(--gold)}
 .sp .l{font-size:.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
+.summary-stat{font-size:.8rem;border-left:1px solid var(--border);padding-left:2rem}
 
 /* -- grid -- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(275px,1fr));gap:.9rem;padding:1.1rem 1.5rem}
@@ -996,8 +1480,9 @@ details[open] summary::before{content:'\25BE'}
   </select>
   <div class="flex-sep"></div>
   <label>Search</label>
-  <input type="text" id="sSearch" placeholder="Search name..." oninput="render()" style="width:140px">
+  <input type="text" id="sSearch" placeholder="Name or item..." oninput="render();searchItems()" style="width:160px">
 </div>
+<div id="item-search-results" style="display:none"></div>
 
 <div class="summary" id="summary"></div>
 <div class="grid"   id="grid"></div>
@@ -1186,6 +1671,7 @@ function openModal(idx){
     ...(ab.zones_visited&&Object.keys(ab.zones_visited).length?[{id:'zones',label:`Zones (${Object.keys(ab.zones_visited).length})`}]:[]),
     ...(c.achievements&&c.achievements.completed&&c.achievements.completed.length?[{id:'achievements',label:`Achievements (${c.achievements.completed.length})`}]:[]),
     ...(c.containers?[{id:'inventory',label:'Inventory'}]:[]),
+    ...(c.mail&&c.mail.length?[{id:'mail',label:`Mail (${c.mail.length})`}]:[]),
   ];
   // If active tab doesn't exist for this char, reset to overview
   if(!tabs.find(t=>t.id===_activeTab))_activeTab='overview';
@@ -1213,6 +1699,7 @@ function renderTabContent(tab,c){
   else if(tab==='zones')     body.innerHTML=buildZones(c);
   else if(tab==='achievements') body.innerHTML=buildAchievements(c);
   else if(tab==='inventory') body.innerHTML=buildInventory(c);
+  else if(tab==='mail')      body.innerHTML=buildMail(c);
 }
 
 /* -- Overview tab -- */
@@ -1404,11 +1891,81 @@ function buildInventory(c){
   return html||'<div style="color:var(--dim);padding:1rem">No inventory data found.</div>';
 }
 
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();hideItemSearch();}});
 
 // Expose openModal globally (allow tab reset logic inline in openModal above)
 window.openModal=openModal;
 window.switchTab=switchTab;
+
+/* -- Mail tab -- */
+function buildMail(c){
+  const mails=c.mail||[];
+  if(!mails.length) return '<div style="color:var(--dim);padding:1rem">No pending mail.</div>';
+  const q={common:'#fff',uncommon:'#1eff00',rare:'#0070dd',epic:'#a335ee',legendary:'#ff8000',poor:'#9d9d9d'};
+  const rows=mails.map(m=>{
+    const col=q[m.item_quality]||'#fff';
+    return `<tr>
+      <td style="color:var(--dim)">${m.sender}</td>
+      <td style="color:${col}">${m.item||'<em style="color:var(--dim)">letter</em>'}</td>
+      <td style="text-align:right">${m.count>1?'x'+m.count:''}</td>
+      <td style="text-align:right;color:var(--dim)">${m.days}d left</td>
+    </tr>`;
+  }).join('');
+  return `<table style="width:100%;border-collapse:collapse;font-size:.85rem">
+    <thead><tr style="color:var(--dim);border-bottom:1px solid var(--border)">
+      <th style="text-align:left;padding:.3rem .4rem">From</th>
+      <th style="text-align:left;padding:.3rem .4rem">Item</th>
+      <th></th><th style="text-align:right;padding:.3rem .4rem">Expires</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/* -- Account gold total in summary -- */
+(function(){
+  const totalCopper=CHARS.reduce((s,c)=>s+(c.money||0),0);
+  const g=Math.floor(totalCopper/10000);
+  const s=Math.floor((totalCopper%10000)/100);
+  const c2=totalCopper%100;
+  const el=document.getElementById('summary');
+  if(el){
+    const goldEl=document.createElement('div');
+    goldEl.className='summary-stat';
+    goldEl.innerHTML=`<span style="color:var(--dim)">Account Gold:</span> <span style="color:#f8cc1b">${g.toLocaleString()}g</span> <span style="color:#c0c0c0">${s}s</span> <span style="color:#cd7f32">${c2}c</span>`;
+    el.appendChild(goldEl);
+  }
+})();
+
+/* -- Cross-character item search -- */
+function searchItems(){
+  const q=(document.getElementById('sSearch').value||'').trim().toLowerCase();
+  const box=document.getElementById('item-search-results');
+  if(q.length<2){box.style.display='none';return;}
+  const rows=[];
+  CHARS.forEach(c=>{
+    const bags=[...((c.containers||{}).bags||[]),((c.containers||{}).bank?{name:'Bank',items:c.containers.bank.items}:null)].filter(Boolean);
+    bags.forEach(bag=>{
+      (bag.items||[]).forEach(item=>{
+        if(item.name.toLowerCase().includes(q)){
+          rows.push({char:c.name,realm:c.realm,bag:bag.name,item:item.name,count:item.count,quality:item.quality});
+        }
+      });
+    });
+  });
+  if(!rows.length){box.innerHTML='<div style="padding:.5rem 1rem;color:var(--dim)">No items found.</div>';box.style.display='block';return;}
+  const qmap={common:'#fff',uncommon:'#1eff00',rare:'#0070dd',epic:'#a335ee',legendary:'#ff8000',poor:'#9d9d9d'};
+  const html=rows.map(r=>`<div style="display:flex;gap:.8rem;padding:.35rem 1rem;border-bottom:1px solid var(--border);align-items:center">
+    <span style="color:${qmap[r.quality]||'#fff'};min-width:180px">${r.item}${r.count>1?` <span style="color:var(--dim)">x${r.count}</span>`:''}</span>
+    <span style="color:var(--text)">${r.char}</span>
+    <span style="color:var(--dim)">${r.realm}</span>
+    <span style="color:var(--dim);margin-left:auto">${r.bag}</span>
+  </div>`).join('');
+  box.innerHTML=`<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;max-height:300px;overflow-y:auto;font-size:.85rem;margin:0 1rem .5rem">`+
+    `<div style="padding:.4rem 1rem;color:var(--dim);border-bottom:1px solid var(--border)">${rows.length} result${rows.length!==1?'s':''} for "${q}"</div>`+
+    html+`</div>`;
+  box.style.display='block';
+}
+function hideItemSearch(){document.getElementById('item-search-results').style.display='none';}
 </script>
 </body>
 </html>

@@ -250,16 +250,54 @@ def _parse_autobiographer(path: Path) -> dict | None:
         result["guild_rank"] = info.get("GuildRankName", "")
         result["played"]     = int(info.get("LastTotalTimePlayed", 0) or 0)
 
-    # -- CATALOGS_CHAR -- zones explored ---------------------------------------
+    # -- CATALOGS_CHAR -- zones explored, boss kills, pvp kills ----------------
     catalogs = vars_.get("AUTOBIOGRAPHER_CATALOGS_CHAR") or {}
-    sz_cat = catalogs.get("SubZoneCatalog") if isinstance(catalogs, dict) else {}
-    if isinstance(sz_cat, dict):
-        zones_map: dict[str, list[str]] = {}
-        for sz_name, sz_data in sz_cat.items():
-            if isinstance(sz_data, dict) and sz_data.get("HasEntered") and isinstance(sz_name, str):
-                zone = str(sz_data.get("ZoneName", "Unknown"))
-                zones_map.setdefault(zone, []).append(sz_name)
-        result["zones_visited"] = {z: sorted(subzones) for z, subzones in sorted(zones_map.items())}
+    if isinstance(catalogs, dict):
+        # Zones explored
+        sz_cat = catalogs.get("SubZoneCatalog") or {}
+        if isinstance(sz_cat, dict):
+            zones_map: dict[str, list[str]] = {}
+            for sz_name, sz_data in sz_cat.items():
+                if isinstance(sz_data, dict) and sz_data.get("HasEntered") and isinstance(sz_name, str):
+                    zone = str(sz_data.get("ZoneName", "Unknown"))
+                    zones_map.setdefault(zone, []).append(sz_name)
+            result["zones_visited"] = {z: sorted(subzones) for z, subzones in sorted(zones_map.items())}
+
+        # Boss kills (BossCatalog — all entries are killed bosses)
+        boss_cat = catalogs.get("BossCatalog") or {}
+        if isinstance(boss_cat, dict):
+            boss_kills = []
+            for _, bdata in boss_cat.items():
+                if isinstance(bdata, dict):
+                    name = str(bdata.get("Name", "")).strip()
+                    if name and bdata.get("Killed"):
+                        boss_kills.append(name)
+            if boss_kills:
+                result["boss_kills"] = sorted(boss_kills)
+
+        # PvP kills (UnitCatalog — UType=2 player kills with Killed=true)
+        unit_cat = catalogs.get("UnitCatalog") or {}
+        if isinstance(unit_cat, dict):
+            pvp_kills = []
+            for _, udata in unit_cat.items():
+                if not isinstance(udata, dict):
+                    continue
+                if not udata.get("Killed"):
+                    continue
+                utype = udata.get("UType")
+                name  = str(udata.get("Name", "")).strip()
+                if not name:
+                    continue
+                if utype == 2:  # player
+                    pvp_kills.append({
+                        "name":  name,
+                        "race":  str(udata.get("Race",  "")),
+                        "class": str(udata.get("Class", "")),
+                    })
+                # utype==1 are pets — skip
+            if pvp_kills:
+                pvp_kills.sort(key=lambda x: x["name"].lower())
+                result["pvp_kills"] = pvp_kills
 
     # -- EVENTS_CHAR -- timeline -----------------------------------------------
     events_tbl = vars_.get("AUTOBIOGRAPHER_EVENTS_CHAR") or {}
@@ -1176,6 +1214,11 @@ def gather() -> list[dict]:
             ab = _parse_autobiographer(sv_dir / "AutoBiographer.lua")
             if ab:
                 chars[ck]["auto_bio"] = ab
+                # Hoist kill lists to top-level for easy JS access
+                if ab.get("boss_kills"):
+                    chars[ck]["boss_kills"] = ab["boss_kills"]
+                if ab.get("pvp_kills"):
+                    chars[ck]["pvp_kills"] = ab["pvp_kills"]
                 # Fill in zone/guild/played from AB if DataStore didn't have them
                 if not chars[ck].get("zone") and ab.get("zone"):
                     chars[ck]["zone"] = ab["zone"]
@@ -1676,6 +1719,7 @@ function openModal(idx){
     ...(c.achievements&&c.achievements.completed&&c.achievements.completed.length?[{id:'achievements',label:`Achievements (${c.achievements.completed.length})`}]:[]),
     ...(c.containers?[{id:'inventory',label:'Inventory'}]:[]),
     ...(c.mail&&c.mail.length?[{id:'mail',label:`Mail (${c.mail.length})`}]:[]),
+    ...((c.boss_kills&&c.boss_kills.length)||(c.pvp_kills&&c.pvp_kills.length)?[{id:'kills',label:`Kills (${(c.boss_kills||[]).length+(c.pvp_kills||[]).length})`}]:[]),
   ];
   // If active tab doesn't exist for this char, reset to overview
   if(!tabs.find(t=>t.id===_activeTab))_activeTab='overview';
@@ -1704,6 +1748,7 @@ function renderTabContent(tab,c){
   else if(tab==='achievements') body.innerHTML=buildAchievements(c);
   else if(tab==='inventory') body.innerHTML=buildInventory(c);
   else if(tab==='mail')      body.innerHTML=buildMail(c);
+  else if(tab==='kills')     body.innerHTML=buildKills(c);
 }
 
 /* -- Overview tab -- */
@@ -1923,6 +1968,56 @@ function buildMail(c){
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+/* -- Kills tab -- */
+function buildKills(c){
+  const bosses=c.boss_kills||[];
+  const pvp=c.pvp_kills||[];
+  if(!bosses.length&&!pvp.length) return '<div style="color:var(--dim);padding:1rem">No kill data recorded.</div>';
+  const CLASS_ICON={
+    'Warrior':'⚔','Paladin':'✝','Hunter':'🏹','Rogue':'🗡','Priest':'✨',
+    'Death Knight':'💀','Shaman':'⚡','Mage':'🔵','Warlock':'🔮','Druid':'🌿',
+    'Monk':'👊','Demon Hunter':'🦇','Evoker':'🐉'
+  };
+  let html='';
+
+  if(bosses.length){
+    html+=`<div style="margin-bottom:1.2rem">
+      <div style="font-weight:600;color:var(--gold);margin-bottom:.5rem">Boss Kills <span style="color:var(--dim);font-weight:400;font-size:.85rem">(${bosses.length})</span></div>
+      <div style="display:flex;flex-wrap:wrap;gap:.3rem .5rem">
+        ${bosses.map(b=>`<span style="background:rgba(255,200,50,.1);border:1px solid rgba(255,200,50,.25);border-radius:3px;padding:.15rem .45rem;font-size:.82rem;color:#f8cc1b">${b}</span>`).join('')}
+      </div>
+    </div>`;
+  }
+
+  if(pvp.length){
+    const byClass={};
+    pvp.forEach(p=>{ (byClass[p.class]=byClass[p.class]||[]).push(p); });
+    const classSummary=Object.entries(byClass).sort((a,b)=>b[1].length-a[1].length)
+      .map(([cls,kills])=>`<span title="${kills.map(k=>k.name).join(', ')}" style="cursor:help;background:rgba(255,50,50,.1);border:1px solid rgba(255,50,50,.25);border-radius:3px;padding:.15rem .45rem;font-size:.82rem;color:#ff6060">${CLASS_ICON[cls]||'⚔'} ${cls} <strong>${kills.length}</strong></span>`).join('');
+    const rows=pvp.map(p=>`<tr>
+      <td style="padding:.2rem .4rem">${p.name}</td>
+      <td style="padding:.2rem .4rem;color:var(--dim)">${p.race||''}</td>
+      <td style="padding:.2rem .4rem;color:var(--dim)">${p.class||''}</td>
+    </tr>`).join('');
+    html+=`<div>
+      <div style="font-weight:600;color:#ff6060;margin-bottom:.5rem">PvP Kills <span style="color:var(--dim);font-weight:400;font-size:.85rem">(${pvp.length})</span></div>
+      <div style="display:flex;flex-wrap:wrap;gap:.3rem .5rem;margin-bottom:.8rem">${classSummary}</div>
+      <details>
+        <summary style="cursor:pointer;color:var(--dim);font-size:.85rem;margin-bottom:.4rem">Show full list</summary>
+        <table style="width:100%;border-collapse:collapse;font-size:.82rem;margin-top:.4rem">
+          <thead><tr style="color:var(--dim);border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:.25rem .4rem">Name</th>
+            <th style="text-align:left;padding:.25rem .4rem">Race</th>
+            <th style="text-align:left;padding:.25rem .4rem">Class</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </details>
+    </div>`;
+  }
+  return `<div style="padding:.25rem">${html}</div>`;
 }
 
 /* -- Account gold total in summary -- */
